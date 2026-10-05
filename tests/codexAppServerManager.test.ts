@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import net from "node:net";
+import http from "node:http";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { detectManagedCodexAppServer, startManagedCodexAppServer, stopManagedCodexAppServer } from "../src/codex/codexAppServerManager.js";
@@ -78,6 +79,65 @@ describe("Codex app-server manager", () => {
       await ctx.cleanup();
     }
   });
+
+  it("prefers explicit readiness failure over healthy liveness", async () => {
+    const ctx = await tempConfig();
+    const requests: string[] = [];
+    const server = http.createServer((req, res) => {
+      requests.push(req.url ?? "");
+      res.writeHead(req.url === "/readyz" ? 503 : 200);
+      res.end(JSON.stringify({ status: "ok" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      ctx.config.codexAppServerMode = "manual";
+      ctx.config.codexAppServerUrl = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+      const result = await detectManagedCodexAppServer(ctx.config);
+      expect(result.available).toBe(false);
+      expect(requests).toEqual(["/readyz"]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await ctx.cleanup();
+    }
+  });
+
+  it("bounds probes when a server never responds", async () => {
+    const ctx = await tempConfig();
+    const server = http.createServer(() => {});
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      ctx.config.codexAppServerMode = "manual";
+      ctx.config.codexAppServerUrl = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+      const start = Date.now();
+      expect((await detectManagedCodexAppServer(ctx.config)).available).toBe(false);
+      expect(Date.now() - start).toBeLessThan(2_000);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await ctx.cleanup();
+    }
+  });
+
+  it("coalesces concurrent starts and escalates a SIGTERM-ignoring server", async () => {
+    const ctx = await tempConfig();
+    try {
+      ctx.config.codexAppServerMode = "auto";
+      ctx.config.codexAppServerPort = await freePort();
+      const binary = path.join(ctx.root, "ignore-term-codex");
+      await fs.writeFile(binary, `#!/usr/bin/env node\nconst http=require('http');const url=new URL(process.argv[process.argv.indexOf('--listen')+1]);http.createServer((req,res)=>res.end('{"status":"ok"}')).listen(Number(url.port),url.hostname);process.on('SIGTERM',()=>{});`, { mode: 0o755 });
+      ctx.config.codexBin = binary;
+      const [first, second] = await Promise.all([startManagedCodexAppServer(ctx.config), startManagedCodexAppServer(ctx.config)]);
+      expect(first.pid).toBe(second.pid);
+      expect(first.details?.loginStatus).toBe("unknown");
+      const stopped = await stopManagedCodexAppServer(ctx.config);
+      expect(stopped.available).toBe(false);
+      expect(() => process.kill(first.pid!, 0)).toThrow();
+    } finally {
+      await stopManagedCodexAppServer(ctx.config).catch(() => undefined);
+      await ctx.cleanup();
+    }
+  }, 8_000);
 
   it("refuses public app-server hosts by default", async () => {
     const ctx = await tempConfig();

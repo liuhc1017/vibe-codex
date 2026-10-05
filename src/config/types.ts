@@ -5,6 +5,8 @@ export type CodexAppServerTransport = "ws" | "http";
 
 export interface Config {
   port: number;
+  controlPort: number;
+  ownerDataDir: string;
   relayToken?: string;
   allowUrlTokenAuth: boolean;
   urlToken?: string;
@@ -17,6 +19,7 @@ export interface Config {
   defaultParentDir: string;
   publicBaseUrl?: string;
   codexBin: string;
+  codexModel?: string;
   terminalApp: string;
   terminalFallbackApp: string;
   preferGhostty: boolean;

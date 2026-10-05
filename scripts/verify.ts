@@ -11,6 +11,7 @@ import { ApprovalStore } from "../src/approvals/actionPolicy.js";
 import { AuthSessionStore } from "../src/server/authSessions.js";
 import { tempConfig } from "../tests/helpers.js";
 import { runProcessArgv } from "../src/util/spawn.js";
+import { getRunCoordinator } from "../src/codex/runCoordinator.js";
 
 function run(command: string, args: string[]) {
   return new Promise<void>((resolve, reject) => {
@@ -39,6 +40,10 @@ async function createFakeWsAppServer(threadId = "verify-thread-1") {
     res.writeHead(404).end();
   });
   const wsServer = new WebSocketServer({ server: httpServer });
+  let cwd = "";
+  let count = 0;
+  const history: any[] = [];
+  const timers = new Set<NodeJS.Timeout>();
   wsServer.on("connection", (socket) => {
     socket.on("message", (data) => {
       const request = JSON.parse(data.toString("utf8"));
@@ -47,10 +52,23 @@ async function createFakeWsAppServer(threadId = "verify-thread-1") {
       const respond = (result: unknown) => socket.send(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
       if (request.method === "initialize") return respond({ protocolVersion: "0.1", serverInfo: { name: "fake-codex-app-server" } });
       if (request.method === "thread/list") return respond({ threads: [{ id: threadId, title: "Verify Thread" }] });
-      if (request.method === "thread/start") return respond({ thread: { id: threadId, status: { type: "running" } } });
-      if (request.method === "thread/resume") return respond({ thread: { id: request.params.threadId, status: { type: "running" } } });
-      if (request.method === "thread/read") return respond({ thread: { id: request.params.threadId, status: { type: "running" } } });
-      if (request.method === "turn/start") return respond({ turn: { id: `turn-${requests.length}`, status: "running" } });
+      if (request.method === "thread/start") {
+        cwd = request.params.cwd;
+        return respond({ thread: { id: threadId, cwd, turns: [], status: { type: "idle" } } });
+      }
+      if (request.method === "thread/resume" || request.method === "thread/read") return respond({ thread: { id: request.params.threadId, cwd, turns: history, status: { type: "idle" } } });
+      if (request.method === "turn/start") {
+        const turn: any = { id: `turn-${++count}`, status: "inProgress", items: [] };
+        history.push(turn);
+        respond({ turn });
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          Object.assign(turn, { status: "completed", items: [{ id: `answer-${count}`, type: "agentMessage", phase: "final_answer", text: `Verified final answer ${count}` }] });
+          socket.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn } }));
+        }, 50);
+        timers.add(timer);
+        return;
+      }
       return socket.send(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } }));
     });
   });
@@ -60,8 +78,9 @@ async function createFakeWsAppServer(threadId = "verify-thread-1") {
     url: `ws://127.0.0.1:${address.port}`,
     requests,
     close: async () => {
-      wsServer.close();
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      for (const timer of timers) clearTimeout(timer);
+      for (const socket of wsServer.clients) socket.terminate();
+      await new Promise<void>((resolve) => wsServer.close(() => httpServer.close(() => resolve())));
     },
   };
 }
@@ -132,6 +151,8 @@ async function mcpSmoke() {
     const workspace = path.join(ctx.root, "verify-project");
     await fs.mkdir(workspace);
     await runProcessArgv({ file: "git", args: ["init"], cwd: workspace });
+    // Fixture setup represents a local owner granting project access.
+    store.createProject({ name: "verify-project", path: await fs.realpath(workspace), preferredExecutionMode: "codex-app-thread" });
     const registered = parseMcpResponse(await (await post({
       jsonrpc: "2.0",
       id: 6,
@@ -154,10 +175,39 @@ async function mcpSmoke() {
       throw new Error("Fake app-server did not receive the app-thread turn/start prompt");
     }
 
-    console.log("verify: OAuth metadata, local MCP metadata, resources, health, fake app-server no-paste, and project registry smoke passed");
+    const call = async (id: number, name: string, args: unknown) => {
+      const response = await post({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }, sessionId);
+      const payload = parseMcpResponse(await response.text());
+      if (!response.ok || payload.result.isError) throw new Error(`Smoke tool ${name} failed.`);
+      return payload.result.structuredContent;
+    };
+    const wait = async (runId: string, expected: string) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const { run } = await call(8, "get_run", { runId });
+        if (run.status === "completed") {
+          if (run.summary !== expected) throw new Error("Final answer was not persisted.");
+          return run;
+        }
+        if (["failed", "recovery_required"].includes(run.status)) throw new Error(`Smoke turn ended ${run.status}.`);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error("Smoke task did not complete.");
+    };
+    await wait(appThreadResult.runId, "Verified final answer 1");
+    const followup = await call(9, "continue_project_task", { projectRef: "verify-project", instruction: "Verify the same-thread follow-up." });
+    if (followup.threadId !== appThreadResult.threadId) throw new Error("Follow-up changed threads.");
+    const finished = await wait(followup.runId, "Verified final answer 2");
+    if (finished.metadata.parentRunId !== appThreadResult.runId) throw new Error("Follow-up lineage is incorrect.");
+    const result = await call(10, "collect_project_result", { runId: finished.id });
+    if (result.status !== "completed" || result.finalAnswer !== "Verified final answer 2") throw new Error("Result collection lost the final answer.");
+    console.log("verify: local MCP, OAuth discovery, project grant, delayed final answer, same-thread follow-up, lineage, and safe result smoke passed (fake Codex; no real model or ChatGPT UI)");
   } finally {
+    await getRunCoordinator(ctx.config, store).close();
+    await app.locals.dispose();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     await fakeAppServer.close();
+    stores.approvals.close();
     store.db.close();
     await ctx.cleanup();
   }

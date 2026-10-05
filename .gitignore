@@ -7,3 +7,5 @@ dist/
 coverage/
 .DS_Store
 .vibe-codex/launchd/
+.vibe-codex/owner/
+.vibe-codex/app-server/

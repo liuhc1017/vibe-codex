@@ -1,6 +1,6 @@
 {
   "name": "vibe-codex",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local MCP relay that lets ChatGPT safely orchestrate Codex on a Mac.",
   "type": "module",
   "main": "dist/src/index.js",
@@ -8,13 +8,16 @@
     "dev": "VIBE_CODEX_DEV=true tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=4 --minWorkers=1",
     "verify": "tsx scripts/verify.ts",
     "verify:public": "tsx scripts/verifyPublicOAuth.ts",
+    "verify:live": "tsx scripts/verifyLive.ts",
     "launchd:install": "tsx scripts/installLaunchAgents.ts install",
     "launchd:status": "tsx scripts/installLaunchAgents.ts status",
     "launchd:uninstall": "tsx scripts/installLaunchAgents.ts uninstall",
-    "pair": "tsx scripts/generatePairToken.ts"
+    "pair": "tsx scripts/generatePairToken.ts",
+    "doctor": "tsx scripts/doctor.ts",
+    "open": "tsx scripts/openControl.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

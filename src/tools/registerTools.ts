@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Config, AutonomyLevel, AUTONOMY_LEVELS } from "../config/types.js";
@@ -14,16 +14,18 @@ import { runWorkspaceCommand } from "../workspace/commands.js";
 import { gitDiff, gitStatus } from "../workspace/git.js";
 import { openCodexApp } from "../codex/codexApp.js";
 import { compileCodexPrompt } from "../codex/promptCompiler.js";
-import { compileProjectCodexPrompt } from "../codex/projectPrompt.js";
 import { collectVisibleRunResult, continueCodexTask, ExecutionMode, startAppSupervisedCodexTask, startCodexAppVisibleTask, startCodexExecTask, startGhosttyInteractiveCodexTask, startTerminalVisibleCodexTask } from "../codex/codexExec.js";
-import { configWithManagedAppServerUrl, detectManagedCodexAppServer, ensureCodexAppServer, restartManagedCodexAppServer, startManagedCodexAppServer, stopManagedCodexAppServer } from "../codex/codexAppServerManager.js";
-import { continueCodexAppThreadWs, forkCodexAppThreadWs, getCodexAppThreadStatusWs, listCodexThreadsWs, resumeCodexAppThreadWs, startCodexAppThreadWs } from "../codex/codexAppServerWsClient.js";
+import { detectManagedCodexAppServer, startManagedCodexAppServer } from "../codex/codexAppServerManager.js";
 import { RunStore } from "../runs/runStore.js";
 import { VibeError, toErrorPayload } from "../util/errors.js";
 import { assertSafeWorkspacePath } from "../safety/paths.js";
 import { classifyCommand } from "../safety/commandRisk.js";
 import { authWarnings, buildConnectorUrl } from "../util/connector.js";
 import { gitIsRepository } from "../workspace/git.js";
+import { getRunCoordinator } from "../codex/runCoordinator.js";
+import { startProjectTask, continueProjectTask } from "../codex/projectTasks.js";
+import { collectRunResult } from "../runs/results.js";
+import { connectorSettings } from "../server/diagnostics.js";
 
 const Autonomy = z.enum(AUTONOMY_LEVELS as [AutonomyLevel, ...AutonomyLevel[]]);
 const Template = z.enum(["empty", "node", "python", "vite", "next", "chrome-extension"]);
@@ -55,8 +57,9 @@ async function discoverProjects(config: Config) {
         if (!entry.isDirectory()) continue;
         const candidate = path.join(root, entry.name);
         try {
-          await fs.stat(path.join(candidate, ".git"));
-          projects.push({ id: `discovered:${candidate}`, name: entry.name, path: candidate });
+          const workspacePath = await assertSafeWorkspacePath(candidate, config);
+          await fs.stat(path.join(workspacePath, ".git"));
+          projects.push({ id: `discovered:${workspacePath}`, name: entry.name, path: workspacePath, registered: false });
         } catch {
           // Not a git project.
         }
@@ -81,106 +84,76 @@ export function registerTools(server: McpServer, config: Config, runStore: RunSt
     return runStore.listRuns().find((run) => run.metadata?.codexThreadId === threadId);
   }
 
-  function appThreadOutput(args: {
-    runId: string;
-    workspacePath: string;
-    response: unknown;
-    fallbackThreadId?: string;
-    sourceThreadId?: string;
-  }) {
-    const normalized = normalizeAppThreadResponse(args.response);
-    const threadId = normalized.threadId ?? args.fallbackThreadId;
+  const coordinator = getRunCoordinator(config, runStore);
+
+  function managedRunOutput(run: ReturnType<RunStore["createRun"]>) {
     return {
-      runId: args.runId,
-      threadId,
-      codexThreadId: threadId,
-      sourceThreadId: args.sourceThreadId,
-      status: appThreadRunStatus(normalized.status),
-      appServerStatus: normalized.status,
-      workspacePath: args.workspacePath,
-      summary: normalized.summary,
-      appServerEvents: normalized.events,
-      appServerResponse: args.response,
-      promptSubmittedAutomatically: true,
-      usesCodexExec: false,
-      usesShellScript: false,
-      requiresManualPaste: false,
-      experimental: true,
-      doNotFallbackToDirectWrite: true,
+      runId: run.id, threadId: run.metadata?.codexThreadId, codexThreadId: run.metadata?.codexThreadId,
+      turnId: run.metadata?.codexTurnId, sourceThreadId: run.metadata?.sourceCodexThreadId, status: run.status, workspacePath: run.workspacePath,
+      summary: run.summary, output: run.stdout, executionMode: "codex-app-thread",
+      promptSubmittedAutomatically: true, usesCodexExec: false, usesShellScript: false,
+      requiresManualPaste: false, noPaste: true, doNotFallbackToDirectWrite: true,
+      nextStep: "Use get_run or collect_project_result with this runId to read progress and the final answer. Approve Codex requests in the local control page.",
     };
   }
 
-  function appServerFallbackDetails(details: unknown) {
-    const record = typeof details === "object" && details !== null ? details as Record<string, unknown> : {};
-    return { recommendedExecutionMode: "ghostty-visible", fallbackExecutionModes: ["ghostty-visible", "codex-app-visible", "app-supervised"], ...record };
+  async function grantedWorkspace(inputPath: string) {
+    const workspacePath = await assertSafeWorkspacePath(inputPath, config);
+    const directory = await fs.stat(workspacePath).catch(() => undefined);
+    if (!directory?.isDirectory() || !runStore.getProjectByPath(workspacePath)) {
+      throw new VibeError("APPROVAL_REQUIRED", "Register this existing repository in the local control page before allowing the connector to access it.", { workspacePath });
+    }
+    return workspacePath;
   }
 
-  function appThreadRunStatus(status: string | undefined) {
-    const normalized = status?.toLowerCase();
-    if (normalized === "failed" || normalized === "error" || normalized === "cancelled" || normalized === "canceled") return "failed";
-    if (normalized === "completed" || normalized === "complete" || normalized === "done" || normalized === "succeeded" || normalized === "success") return "completed";
-    return "running";
+  async function grantedRecordPath(workspacePath: string) {
+    const currentPath = await grantedWorkspace(workspacePath).catch(() => undefined);
+    if (currentPath !== workspacePath) {
+      throw new VibeError("APPROVAL_REQUIRED", "This stored workspace is no longer available to the connector. Select an existing project granted in the local control page.");
+    }
   }
 
-  function partialThreadIdFromError(error: unknown): string | undefined {
-    if (!(error instanceof VibeError)) return undefined;
-    const threadId = error.details.codexThreadId ?? error.details.threadId;
-    return typeof threadId === "string" ? threadId : undefined;
+  async function accessibleProjects() {
+    const candidates = await Promise.all(runStore.listProjects().map(async (project) => {
+      await grantedRecordPath(project.path);
+      return project;
+    }).map((candidate) => candidate.catch(() => undefined)));
+    return candidates.filter((project) => project !== undefined);
   }
 
-  function partialAppThreadMetadata(error: unknown): Record<string, unknown> {
-    if (!(error instanceof VibeError)) return {};
-    return {
-      codexThreadId: partialThreadIdFromError(error),
-      appServerResponse: error.details.threadResponse,
-      appServerEvents: error.details.events,
-      appServerError: { code: error.code, message: error.message, details: error.details },
-      turnStartFailed: error.details.turnStartFailed === true,
-    };
+  async function accessibleRuns(workspacePath?: string) {
+    const grantedPaths = new Set((await accessibleProjects()).map((project) => project.path));
+    return runStore.listRuns(workspacePath).filter((run) => grantedPaths.has(run.workspacePath));
   }
 
-  function normalizeAppThreadResponse(response: unknown): {
-    threadId?: string;
-    status?: string;
-    summary?: string;
-    events?: unknown[];
-  } {
-    if (typeof response !== "object" || response === null) return {};
-    const record = response as Record<string, unknown>;
-    const threadResponse = typeof record.threadResponse === "object" && record.threadResponse !== null ? record.threadResponse as Record<string, unknown> : undefined;
-    const turnResponse = typeof record.turnResponse === "object" && record.turnResponse !== null ? record.turnResponse as Record<string, unknown> : undefined;
-    const thread = typeof threadResponse?.thread === "object" && threadResponse.thread !== null
-      ? threadResponse.thread as Record<string, unknown>
-      : typeof record.thread === "object" && record.thread !== null
-        ? record.thread as Record<string, unknown>
-        : undefined;
-    const turn = typeof turnResponse?.turn === "object" && turnResponse.turn !== null ? turnResponse.turn as Record<string, unknown> : undefined;
-    const status = typeof turn?.status === "string"
-      ? turn.status
-      : typeof thread?.status === "string"
-        ? thread.status
-        : typeof (thread?.status as Record<string, unknown> | undefined)?.type === "string"
-          ? (thread?.status as Record<string, unknown>).type as string
-          : typeof record.status === "string"
-            ? record.status
-            : undefined;
-    return {
-      threadId: typeof record.threadId === "string" ? record.threadId : typeof thread?.id === "string" ? thread.id : undefined,
-      status,
-      summary: typeof record.summary === "string" ? record.summary : undefined,
-      events: Array.isArray(record.events) ? record.events : [],
-    };
+  async function accessibleApprovals() {
+    const candidates = await Promise.all(approvalStore.list("pending").map(async (approval) => {
+      const summary = approval.actionSummary;
+      if (summary.tool === "create_workspace") {
+        await assertSafeWorkspacePath(typeof summary.parentDir === "string" ? summary.parentDir : config.defaultParentDir, config);
+      } else if (typeof summary.workspacePath === "string") {
+        if (summary.tool === "register_project") await assertSafeWorkspacePath(summary.workspacePath, config);
+        else await grantedRecordPath(summary.workspacePath);
+      } else return undefined;
+      return approval;
+    }).map((candidate) => candidate.catch(() => undefined)));
+    return candidates.filter((approval) => approval !== undefined);
+  }
+
+  function exactApproval(actionRisk: ActionRisk, reason: string, summary: Record<string, unknown>) {
+    if (approvalStore.consumeApproved(actionRisk, summary)) return null;
+    return approvalRequired(approvalStore.create({ reason, actionRisk, actionSummary: summary }));
   }
 
   async function resolveProject(projectRef: string) {
     const byId = runStore.getProject(projectRef);
-    if (byId) return byId;
+    if (byId) { await grantedRecordPath(byId.path); return byId; }
     const byName = runStore.getProjectByName(projectRef);
-    if (byName) return byName;
+    if (byName) { await grantedRecordPath(byName.path); return byName; }
     const safePath = await assertSafeWorkspacePath(projectRef, config).catch(() => undefined);
     if (safePath) {
       const byPath = runStore.getProjectByPath(safePath);
-      if (byPath) return byPath;
+      if (byPath) { await grantedRecordPath(byPath.path); return byPath; }
     }
     throw new VibeError("CONFIG_ERROR", "Registered project not found.", { projectRef });
   }
@@ -195,10 +168,6 @@ export function registerTools(server: McpServer, config: Config, runStore: RunSt
       defaultCodexThreadId: setDefault ? threadId : project.defaultCodexThreadId,
       lastUsedAt: new Date().toISOString(),
     });
-  }
-
-  async function gitStatusText(workspacePath: string) {
-    return (await gitStatus(workspacePath, config).catch(() => undefined))?.stdout ?? "";
   }
 
   function summarizeRun(run: ReturnType<RunStore["listRuns"]>[number]) {
@@ -236,16 +205,6 @@ export function registerTools(server: McpServer, config: Config, runStore: RunSt
       allowedRootCount: session.allowedRoots.length,
       defaultAutonomy: session.defaultAutonomy,
     };
-  }
-
-  async function projectFallbackError() {
-    const detection = await detectManagedCodexAppServer(config);
-    return new VibeError("CODEX_APP_SERVER_UNAVAILABLE", detection.lastError ?? "Codex app-server is unavailable. Use app-supervised/codex-app-visible for manual GUI fallback or ghostty-visible for terminal automatic submission.", {
-      ...appServerFallbackDetails({ status: detection }),
-      recommendedExecutionMode: "ghostty-visible",
-      fallbackExecutionModes: ["ghostty-visible", "codex-app-visible", "app-supervised"],
-      noPasteRequires: "A healthy local Codex app-server managed by Vibe Codex or configured with CODEX_APP_SERVER_URL",
-    });
   }
 
   async function assertGitWorkspace(workspacePath: string) {
@@ -295,11 +254,12 @@ For URL-token fallback, run \`npm run pair -- --write-env\` and use \`https://<n
 
 ## First Workflow
 
-1. Call \`relay_health\`.
-2. Call \`register_project\` for an existing Git workspace.
-3. Use \`start_project_task\` for implementation work.
-4. Use \`send_codex_app_thread_message\` for plain messages to existing Codex app threads.
-5. Use \`collect_project_result\`, \`git_status\`, and \`git_diff\` to inspect results.
+1. Open the private workbench with \`npm run open\` and register an existing Git project locally.
+2. Approve the OAuth connection in that workbench; remote tools cannot grant consent.
+3. Use \`list_projects\` then \`start_project_task\` for implementation work.
+4. Poll \`get_run\` for progress and final status; handle Codex decisions in the workbench.
+5. Read \`collect_project_result\` and inspect safe changes; use \`continue_project_task\` for same-thread follow-up.
+6. Use \`send_codex_app_thread_message\` only for plain messages to a known same-workspace thread.
 `;
   }
 
@@ -310,8 +270,8 @@ For URL-token fallback, run \`npm run pair -- --write-env\` and use \`https://<n
 
 - \`start_project_task\` and \`continue_project_task\` are for implementation or inspection tasks in registered projects. They add a Vibe Codex handoff envelope.
 - \`send_codex_app_thread_message\`, \`run_codex_app_thread_turn\`, and \`continue_codex_app_thread\` send raw/plain text to existing local Codex app threads. They do not add the handoff envelope.
-- \`codex-app-thread\` is true no-paste Codex app/thread execution through local app-server WebSocket JSON-RPC.
-- \`ghostty-visible\` is the no-paste terminal fallback.
+- \`codex-app-thread\` is managed Codex execution; it does not drive or synchronize the Codex Desktop UI.
+- \`ghostty-visible\` is legacy terminal delivery. If direct launch is unavailable, the fallback may require manual input; delivery is not completion.
 - \`codex-app-visible\` and \`app-supervised\` are manual-paste GUI fallbacks.
 
 ## Safety Rules
@@ -325,7 +285,7 @@ For URL-token fallback, run \`npm run pair -- --write-env\` and use \`https://<n
 
 ## Project Reuse
 
-Register a project once with \`register_project\`. Continue work by project id, name, or workspace path. \`continue_project_task\` uses the project's default Codex thread when available.
+Register a project once in the private local workbench. A remote \`register_project\` request requires a one-use owner decision there. Continue work by project id, name, or workspace path. \`continue_project_task\` uses the project's default Codex thread when available. \`set_project_default_thread\` only selects a thread already remembered for the same workspace.
 `;
   }
 
@@ -334,7 +294,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
     const normalized = baseUrl.replace(/\/+$/, "");
     const url = config.enableExperimentalOAuth
       ? `${normalized}/.well-known/oauth-protected-resource`
-      : normalized;
+      : `${normalized}/health`;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2_500) });
       const body = await response.text().catch(() => "");
@@ -369,7 +329,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
       uri: uri.href,
       mimeType: "application/json",
       text: JSON.stringify({
-        version: "0.2.1",
+        version: "0.3.0",
         app: {
           name: "Vibe Codex",
           description: "Tell ChatGPT what to build. Watch Codex do it.",
@@ -384,10 +344,10 @@ Register a project once with \`register_project\`. Continue work by project id, 
           publicReachability: await checkPublicReachability(config.publicBaseUrl),
         },
         codexAppServer: await detectManagedCodexAppServer(config),
-        projects: runStore.listProjects().slice(0, 20),
+        projects: (await accessibleProjects()).slice(0, 20),
         urlTokenAuthEnabled: config.allowUrlTokenAuth,
-        recentRuns: runStore.listRuns().slice(0, 5).map(summarizeRun),
-        pendingApprovals: approvalStore.list("pending"),
+        recentRuns: (await accessibleRuns()).slice(0, 5).map(summarizeRun),
+        pendingApprovals: await accessibleApprovals(),
         authSessions: stores.authSessions.list().slice(0, 10).map(summarizeAuthSession),
         warnings: authWarnings(config),
       }, null, 2),
@@ -429,7 +389,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
     const codexVersion = await getCodexVersion(config);
     return {
       status: codexVersion ? "ok" : "degraded",
-      version: "0.2.1",
+      version: "0.3.0",
       codexAvailable: !!codexVersion,
       codexVersion: codexVersion ?? undefined,
       terminal: {
@@ -456,22 +416,14 @@ Register a project once with \`register_project\`. Continue work by project id, 
     inputSchema: z.object({ baseUrl: z.string().url().optional(), recentRunLimit: z.number().int().min(1).max(20).optional(), checkPublicReachability: z.boolean().optional() }).optional(),
   }, async (args) => safeTool(async () => {
     const baseUrl = args?.baseUrl ?? config.publicBaseUrl;
-    const recentRuns = runStore.listRuns().slice(0, args?.recentRunLimit ?? 5).map(summarizeRun);
-    const pendingApprovals = approvalStore.list("pending");
-    const connectorUsesOAuth = config.enableExperimentalOAuth;
-    const mcpUrl = baseUrl
-      ? connectorUsesOAuth
-        ? `${baseUrl.replace(/\/+$/, "")}/mcp`
-        : buildConnectorUrl({ baseUrl })
-      : connectorUsesOAuth
-        ? "https://<ngrok-url>/mcp"
-        : "https://<ngrok-url>/mcp/<URL_TOKEN>";
+    const recentRuns = (await accessibleRuns()).slice(0, args?.recentRunLimit ?? 5).map(summarizeRun);
+    const pendingApprovals = await accessibleApprovals();
     return {
       status: "ok",
-      version: "0.2.1",
+      version: "0.3.0",
       chatGptDeveloperMode: {
-        authentication: connectorUsesOAuth ? "OAuth" : "No auth",
-        mcpUrl,
+        authentication: connectorSettings(config).authentication,
+        mcpUrl: connectorSettings({ ...config, publicBaseUrl: baseUrl }).mcpUrl,
         oauthEnabled: config.enableExperimentalOAuth,
         urlTokenAuthEnabled: config.allowUrlTokenAuth,
       },
@@ -502,9 +454,9 @@ Register a project once with \`register_project\`. Continue work by project id, 
     if (!baseUrl) throw new VibeError("CONFIG_ERROR", "Provide baseUrl or set PUBLIC_BASE_URL.", {});
     const connectorUsesOAuth = config.enableExperimentalOAuth;
     return {
-      authentication: connectorUsesOAuth ? "OAuth" : "No auth",
-      mcpUrl: connectorUsesOAuth ? `${baseUrl.replace(/\/+$/, "")}/mcp` : buildConnectorUrl({ baseUrl }),
-      tokenRedacted: !connectorUsesOAuth,
+      authentication: connectorSettings(config).authentication,
+      mcpUrl: connectorSettings({ ...config, publicBaseUrl: baseUrl }).mcpUrl,
+      tokenRedacted: config.allowUrlTokenAuth && !connectorUsesOAuth,
       oauthEnabled: config.enableExperimentalOAuth,
       urlTokenAuthEnabled: config.allowUrlTokenAuth,
       warnings: authWarnings(config),
@@ -515,7 +467,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
     description: "List known Vibe Codex projects, optionally discovering git repos under allowed roots.",
     inputSchema: z.object({ includeDiscovered: z.boolean().optional() }).optional(),
   }, async (args) => safeTool(async () => {
-    const stored = runStore.listProjects();
+    const stored = await accessibleProjects();
     const discovered = args?.includeDiscovered ? await discoverProjects(config) : [];
     return { projects: [...stored, ...discovered] };
   }));
@@ -533,15 +485,11 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const workspacePath = await assertSafeWorkspacePath(args.workspacePath, config);
     await assertGitWorkspace(workspacePath);
-    const project = runStore.createProject({
-      name: args.name,
-      path: workspacePath,
-      repoRemote: args.repoRemote,
-      preferredExecutionMode: args.preferredExecutionMode ?? "codex-app-thread",
-      defaultCodexThreadId: args.defaultCodexThreadId,
-      recentCodexThreadIds: args.defaultCodexThreadId ? [args.defaultCodexThreadId] : [],
-      notes: args.notes,
-    });
+    const existing = runStore.getProjectByPath(workspacePath);
+    if (existing) return { project: existing, reusedExistingWorkspace: true, createdWorkspace: false };
+    const approval = exactApproval("write", "Allow this ChatGPT connector to access an existing project.", { tool: "register_project", ...args, workspacePath });
+    if (approval) return approval;
+    const project = runStore.createProject({ name: args.name, path: workspacePath, repoRemote: args.repoRemote, preferredExecutionMode: args.preferredExecutionMode ?? "codex-app-thread", defaultCodexThreadId: args.defaultCodexThreadId, notes: args.notes });
     return { project, reusedExistingWorkspace: true, createdWorkspace: false };
   }));
 
@@ -560,10 +508,15 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }));
 
   server.registerTool("set_project_default_thread", {
-    description: "Set the default Codex app-server thread for a registered project.",
+    description: "Select a Codex app-server thread already remembered for the same registered workspace as the project's default.",
     inputSchema: z.object({ projectRef: z.string(), codexThreadId: z.string() }),
   }, async (args) => safeTool(async () => {
     const project = await resolveProject(args.projectRef);
+    const mappedRuns = runStore.listRuns().filter((run) => run.metadata?.codexThreadId === args.codexThreadId);
+    const remembered = project.defaultCodexThreadId === args.codexThreadId || project.recentCodexThreadIds?.includes(args.codexThreadId);
+    if (mappedRuns.some((run) => run.workspacePath !== project.path) || (!remembered && !mappedRuns.some((run) => run.workspacePath === project.path))) {
+      throw new VibeError("APPROVAL_REQUIRED", "Select a thread already remembered for this workspace. Resume it explicitly in the registered workspace first; Codex validates its directory before starting a turn.", { projectId: project.id });
+    }
     return { project: rememberProjectThread(project.id, args.codexThreadId, true) };
   }));
 
@@ -600,137 +553,31 @@ Register a project once with \`register_project\`. Continue work by project id, 
       verification: z.array(z.string()).optional(),
     }),
   }, async (args) => safeTool(async () => {
+    const project = await resolveProject(args.projectRef);
+    const workspacePath = await grantedWorkspace(project.path);
     const autonomy = args.autonomy ?? "workspace";
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot start project tasks.", { autonomy });
-    const project = await resolveProject(args.projectRef);
-    const workspacePath = await assertSafeWorkspacePath(project.path, config);
-    await assertGitWorkspace(workspacePath);
     const executionMode = args.executionMode ?? project.preferredExecutionMode ?? "codex-app-thread";
-    if (executionMode === "codex-app-thread") {
-      const detection = await ensureCodexAppServer(config);
-      if (!detection.available) throw await projectFallbackError();
-      const appServerConfig = configWithManagedAppServerUrl(config, detection);
-      const placeholder = runStore.createRun({
-        projectId: project.id,
-        workspacePath,
-        status: "queued",
-        autonomy,
-        prompt: args.userGoal,
-        command: "codex-app-thread project pending",
-        metadata: { projectId: project.id, executionMode, codexThreadId: args.codexThreadId, baselineGitStatus: await gitStatusText(workspacePath) },
-      });
-      const sourceThreadId = args.codexThreadId ?? project.defaultCodexThreadId;
-      const prompt = compileProjectCodexPrompt({ project, runId: placeholder.id, workspacePath, userGoal: args.userGoal, executionMode, autonomy, codexThreadId: sourceThreadId, context: args.context, constraints: args.constraints, acceptanceCriteria: args.acceptanceCriteria, verification: args.verification });
-      let response: unknown;
-      try {
-        response = sourceThreadId && args.forkThread
-          ? await forkCodexAppThreadWs({ threadId: sourceThreadId, workspacePath, instruction: prompt, config: appServerConfig })
-          : sourceThreadId
-            ? await continueCodexAppThreadWs({ threadId: sourceThreadId, workspacePath, instruction: prompt, config: appServerConfig })
-            : await startCodexAppThreadWs({ workspacePath, prompt, config: appServerConfig });
-      } catch (error) {
-        const partialThreadId = partialThreadIdFromError(error);
-        runStore.updateRun(placeholder.id, {
-          status: "failed",
-          prompt,
-          codexCommand: "codex-app-thread project",
-          metadata: {
-            ...placeholder.metadata,
-            projectId: project.id,
-            executionMode,
-            ...partialAppThreadMetadata(error),
-          },
-        });
-        rememberProjectThread(project.id, partialThreadId, args.setDefaultThread ?? true);
-        throw error;
-      }
-      const normalized = normalizeAppThreadResponse(response);
-      const threadId = normalized.threadId ?? sourceThreadId;
-      const run = runStore.updateRun(placeholder.id, {
-        status: appThreadRunStatus(normalized.status),
-        prompt,
-        codexCommand: "codex-app-thread project",
-        metadata: {
-          ...placeholder.metadata,
-          projectId: project.id,
-          executionMode,
-          codexThreadId: threadId,
-          appServerResponse: response,
-          appServerEvents: normalized.events,
-          appServerSummary: normalized.summary,
-          summary: normalized.summary,
-        },
-      });
-      const updatedProject = rememberProjectThread(project.id, threadId, args.setDefaultThread ?? true);
-      return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: threadId, sourceThreadId: args.forkThread ? sourceThreadId : undefined }), project: updatedProject, executionMode, appServer: detection, noPaste: true, createdWorkspace: false };
-    }
-    if (executionMode === "ghostty-visible") {
-      const promptRunId = randomUUID();
-      const prompt = compileProjectCodexPrompt({ project, runId: promptRunId, workspacePath, userGoal: args.userGoal, executionMode, autonomy, context: args.context, constraints: args.constraints, acceptanceCriteria: args.acceptanceCriteria, verification: args.verification });
-      const run = await startGhosttyInteractiveCodexTask({ workspacePath, prompt, autonomy, config, runStore });
-      runStore.updateRun(run.id, { metadata: { ...(run.metadata ?? {}), projectId: project.id, executionMode, baselineGitStatus: await gitStatusText(workspacePath) } });
-      runStore.touchProject(project.id);
-      return {
-        runId: run.id,
-        projectId: project.id,
-        status: run.status,
-        executionMode,
-        workspacePath,
-        promptPath: run.metadata?.promptPath,
-        createdWorkspace: false,
-        noPaste: true,
-        terminalApp: run.metadata?.terminalApp,
-        launchedCodexDirectly: run.metadata?.launchedCodexDirectly === true,
-        promptSubmittedAutomatically: run.metadata?.promptSubmittedAutomatically === true,
-        usesCodexExec: false,
-        usesShellScript: false,
-        requiresManualPaste: false,
-      };
-    }
-    throw new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "codex-app-visible/app-supervised is manual paste fallback. Use start_codex_task or select ghostty-visible when app-server is unavailable.", { recommendedExecutionMode: "codex-app-thread", fallbackExecutionModes: ["app-supervised", "codex-app-visible", "ghostty-visible"] });
+    const approval = maybeApproval("codex-visible", "Codex project execution requires local approval.", { tool: "start_project_task", ...args, workspacePath, autonomy, executionMode });
+    if (approval) return approval;
+    if (executionMode !== "codex-app-thread") throw new VibeError("CONFIG_ERROR", "Project tasks use managed Codex. Explicit GUI delivery is available through start_codex_task and does not track completion.", { executionMode });
+    const run = await startProjectTask(config, runStore, args);
+    return { ...managedRunOutput(run), project: runStore.getProject(project.id), createdWorkspace: false };
   }));
 
   server.registerTool("continue_project_task", {
     description: "Continue an implementation or inspection task for a registered project using the project's default Codex thread. This compiles a Vibe Codex handoff prompt. Do not use it to send a plain message to an existing Codex chat; use continue_codex_app_thread instead.",
     inputSchema: z.object({ projectRef: z.string(), instruction: z.string(), executionMode: ProjectExecutionModeSchema.optional(), autonomy: Autonomy.optional(), codexThreadId: z.string().optional(), setDefaultThread: z.boolean().optional() }),
   }, async (args) => safeTool(async () => {
-    const project = await resolveProject(args.projectRef);
-    const threadId = args.codexThreadId ?? project.defaultCodexThreadId;
-    if (!threadId) throw new VibeError("CONFIG_ERROR", "No codexThreadId provided and project has no default Codex thread.", { projectId: project.id, fallbackExecutionModes: ["start_project_task", "ghostty-visible", "app-supervised"] });
     const autonomy = args.autonomy ?? "workspace";
-    const executionMode = args.executionMode ?? "codex-app-thread";
-    if (executionMode !== "codex-app-thread") throw new VibeError("CONFIG_ERROR", "continue_project_task uses codex-app-thread for no-paste continuation.", { executionMode });
-    const detection = await ensureCodexAppServer(config);
-    if (!detection.available) throw await projectFallbackError();
-    const appServerConfig = configWithManagedAppServerUrl(config, detection);
-    const workspacePath = await assertSafeWorkspacePath(project.path, config);
-    await assertGitWorkspace(workspacePath);
-    const placeholder = runStore.createRun({ projectId: project.id, workspacePath, status: "queued", autonomy, prompt: args.instruction, command: "codex-app-thread project continue pending", metadata: { projectId: project.id, executionMode, codexThreadId: threadId, baselineGitStatus: await gitStatusText(workspacePath) } });
-    const prompt = compileProjectCodexPrompt({ project, runId: placeholder.id, workspacePath, userGoal: args.instruction, executionMode, autonomy, codexThreadId: threadId });
-    let response: Awaited<ReturnType<typeof continueCodexAppThreadWs>>;
-    try {
-      response = await continueCodexAppThreadWs({ threadId, workspacePath, instruction: prompt, config: appServerConfig });
-    } catch (error) {
-      runStore.updateRun(placeholder.id, {
-        status: "failed",
-        prompt,
-        codexCommand: "codex-app-thread project continue",
-        metadata: {
-          ...placeholder.metadata,
-          projectId: project.id,
-          executionMode,
-          codexThreadId: threadId,
-          ...partialAppThreadMetadata(error),
-        },
-      });
-      rememberProjectThread(project.id, partialThreadIdFromError(error) ?? threadId, args.setDefaultThread ?? true);
-      throw error;
-    }
-    const normalized = normalizeAppThreadResponse(response);
-    const nextThreadId = normalized.threadId ?? threadId;
-    const run = runStore.updateRun(placeholder.id, { status: appThreadRunStatus(normalized.status), prompt, codexCommand: "codex-app-thread project continue", metadata: { ...placeholder.metadata, projectId: project.id, executionMode, codexThreadId: nextThreadId, parentRunId: runStore.listRuns(project.path).find((candidate) => candidate.metadata?.codexThreadId === threadId)?.id, appServerResponse: response, appServerEvents: normalized.events, appServerSummary: normalized.summary, summary: normalized.summary } });
-    const updatedProject = rememberProjectThread(project.id, nextThreadId, args.setDefaultThread ?? true);
-    return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: nextThreadId }), project: updatedProject, executionMode, appServer: detection, noPaste: true, createdWorkspace: false };
+    if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot continue project tasks.", { autonomy });
+    if (args.executionMode && args.executionMode !== "codex-app-thread") throw new VibeError("CONFIG_ERROR", "Follow-up tasks use managed Codex.", {});
+    const project = await resolveProject(args.projectRef);
+    await grantedWorkspace(project.path);
+    const approval = maybeApproval("codex-visible", "Codex continuation requires local approval.", { tool: "continue_project_task", ...args, workspacePath: project.path, autonomy });
+    if (approval) return approval;
+    const run = await continueProjectTask(config, runStore, args);
+    return { ...managedRunOutput(run), project: runStore.getProject(project.id), createdWorkspace: false };
   }));
 
   server.registerTool("collect_project_result", {
@@ -739,20 +586,8 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const run = runStore.getRun(args.runId);
     if (!run) throw new VibeError("CONFIG_ERROR", "Run not found.", { runId: args.runId });
-    const projectId = typeof run.metadata?.projectId === "string" ? run.metadata.projectId : undefined;
-    const visibleModes = ["codex-app-visible", "app-supervised", "ghostty-visible", "terminal-visible"];
-    if (typeof run.metadata?.executionMode === "string" && visibleModes.includes(run.metadata.executionMode)) {
-      const collected = await collectVisibleRunResult({ runId: args.runId, config, runStore, maxBytes: args.maxBytes });
-      return { projectId, ...collected };
-    }
-    const finalStatus = await gitStatusText(run.workspacePath);
-    const baseline = typeof run.metadata?.baselineGitStatus === "string" ? run.metadata.baselineGitStatus : "";
-    const changedFiles = finalStatus.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => line.slice(3).trim()).filter((file) => !file.startsWith(".vibe-codex/"));
-    const baselineFiles = new Set(baseline.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => line.slice(3).trim()).filter((file) => !file.startsWith(".vibe-codex/")));
-    const newChangedFilesSinceRun = changedFiles.filter((file) => !baselineFiles.has(file));
-    const diff = await gitDiff(run.workspacePath, config, args.maxBytes ?? 80_000).catch(() => undefined);
-    const updated = runStore.updateRun(run.id, { metadata: { ...(run.metadata ?? {}), finalGitStatus: finalStatus, changedFilesSinceRun: changedFiles, newChangedFilesSinceRun } });
-    return { run: updated, projectId, status: updated.status, gitStatus: finalStatus, gitDiffSummary: diff?.stdout ?? "", changedFilesSinceRun: changedFiles, newChangedFilesSinceRun };
+    await grantedRecordPath(run.workspacePath);
+    return collectRunResult(config, runStore, args.runId, args.maxBytes);
   }));
 
   server.registerTool("create_workspace", {
@@ -768,6 +603,9 @@ Register a project once with \`register_project\`. Continue work by project id, 
     }),
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
+    if (!canWriteFiles(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot create workspaces.", { autonomy });
+    const gate = exactApproval("write", "Creating a new workspace requires local owner approval.", { tool: "create_workspace", ...args, autonomy });
+    if (gate) return gate;
     const result = await createWorkspaceImpl({
       name: args.name,
       parentDir: args.parentDir,
@@ -785,12 +623,12 @@ Register a project once with \`register_project\`. Continue work by project id, 
   server.registerTool("list_files", {
     description: "List safe files inside a workspace.",
     inputSchema: z.object({ workspacePath: z.string(), relativeDir: z.string().optional(), maxDepth: z.number().int().min(0).max(10).optional() }),
-  }, async (args) => safeTool(async () => ({ files: await listFiles(args.workspacePath, args.relativeDir, args.maxDepth ?? 3, config) })));
+  }, async (args) => safeTool(async () => ({ files: await listFiles(await grantedWorkspace(args.workspacePath), args.relativeDir, args.maxDepth ?? 3, config) })));
 
   server.registerTool("read_file", {
     description: "Read a safe non-secret file inside a workspace.",
     inputSchema: z.object({ workspacePath: z.string(), relativePath: z.string(), maxBytes: z.number().int().positive().max(1_000_000).optional() }),
-  }, async (args) => safeTool(async () => readFile(args.workspacePath, args.relativePath, config, args.maxBytes ?? 200_000)));
+  }, async (args) => safeTool(async () => readFile(await grantedWorkspace(args.workspacePath), args.relativePath, config, args.maxBytes ?? 200_000)));
 
   server.registerTool("write_file", {
     description: "Write a file inside a workspace when autonomy allows writes. Do not use direct write_file as fallback for a failed Codex task unless the user explicitly authorizes fallback.",
@@ -798,15 +636,17 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
     if (!canWriteFiles(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot write files.", { autonomy });
+    const workspacePath = await grantedWorkspace(args.workspacePath);
     const approval = maybeApproval("write", "Direct file writes require local approval.", {
       tool: "write_file",
-      workspacePath: args.workspacePath,
+      workspacePath,
       relativePath: args.relativePath,
+      contentHash: createHash("sha256").update(args.content).digest("hex"),
       overwrite: args.overwrite ?? false,
       autonomy,
     });
     if (approval) return approval;
-    const result = await writeFile(args.workspacePath, args.relativePath, args.content, args.overwrite ?? false, config);
+    const result = await writeFile(workspacePath, args.relativePath, args.content, args.overwrite ?? false, config);
     return { ...result, directWrite: true, doNotUseAsCodexFallbackWithoutUserApproval: true };
   }));
 
@@ -815,6 +655,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
     inputSchema: z.object({ workspacePath: z.string(), command: z.string(), autonomy: Autonomy.optional(), timeoutMs: z.number().int().positive().optional() }),
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
+    await grantedWorkspace(args.workspacePath);
     const classified = classifyCommand(args.command);
     if (classified.risk === "normal") {
       const approval = maybeApproval("execute", "Normal workspace commands require local approval.", {
@@ -832,7 +673,10 @@ Register a project once with \`register_project\`. Continue work by project id, 
     description: "Open a workspace in the Codex desktop app for visual supervision.",
     inputSchema: z.object({ workspacePath: z.string() }),
   }, async (args) => safeTool(async () => {
-    const result = await openCodexApp(args.workspacePath, config);
+    const workspacePath = await grantedWorkspace(args.workspacePath);
+    const approval = maybeApproval("codex-visible", "Opening Codex Desktop requires local approval.", { tool: "open_in_codex_app", workspacePath });
+    if (approval) return approval;
+    const result = await openCodexApp(workspacePath, config);
     return { opened: result.exitCode === 0, command: result.command, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }));
 
@@ -857,9 +701,9 @@ Register a project once with \`register_project\`. Continue work by project id, 
     }),
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
-    const executionMode = (args.executionMode ?? (args.codexThreadId ? "codex-app-thread" : config.defaultVisibleMode)) as ExecutionMode;
+    const executionMode = (args.executionMode ?? "codex-app-thread") as ExecutionMode;
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot start Codex tasks.", { autonomy });
-    const workspacePath = await assertSafeWorkspacePath(args.workspacePath, config);
+    const workspacePath = await grantedWorkspace(args.workspacePath);
     if (!args.skipGitRepoCheckAllowed) await assertGitWorkspace(workspacePath);
     const prompt = compileCodexPrompt({ workspacePath, userGoal: args.userGoal, context: args.context, constraints: args.constraints, nonGoals: args.nonGoals, acceptanceCriteria: args.acceptanceCriteria, verification: args.verification, autonomy });
 
@@ -871,6 +715,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
         workspacePath,
         userGoal: args.userGoal,
         autonomy,
+        promptHash: createHash("sha256").update(prompt).digest("hex"),
       });
       if (approval) return approval;
       const run = await startGhosttyInteractiveCodexTask({ workspacePath, prompt, autonomy, config, runStore });
@@ -886,7 +731,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
         promptSubmittedAutomatically: run.metadata?.promptSubmittedAutomatically === true,
         usesCodexExec: false,
         usesShellScript: false,
-        requiresManualPaste: false,
+        requiresManualPaste: run.metadata?.promptSubmittedAutomatically !== true,
         requiresVisibleSupervision: true,
         doNotFallbackToDirectWrite: true,
         message: run.metadata?.launchedCodexDirectly === true
@@ -903,6 +748,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
         workspacePath,
         userGoal: args.userGoal,
         autonomy,
+        promptHash: createHash("sha256").update(prompt).digest("hex"),
       });
       if (approval) return approval;
       const run = await startTerminalVisibleCodexTask({ workspacePath, prompt, autonomy, config, runStore, executionMode });
@@ -923,69 +769,9 @@ Register a project once with \`register_project\`. Continue work by project id, 
     }
 
     if (executionMode === "codex-app-thread") {
-      const detection = await ensureCodexAppServer(config);
-      if (!detection.available) {
-        throw new VibeError("CODEX_APP_SERVER_UNAVAILABLE", detection.lastError ?? "Codex app-server is unavailable. Use codex-app-visible or ghostty-visible for supervised runs.", appServerFallbackDetails({ status: detection }));
-      }
-      const appServerConfig = configWithManagedAppServerUrl(config, detection);
-      const approval = maybeApproval("codex-visible", "Codex app-thread execution requires local approval.", {
-        tool: "start_codex_task",
-        executionMode,
-        workspacePath,
-        userGoal: args.userGoal,
-        codexThreadId: args.codexThreadId,
-        continueExistingThread: args.continueExistingThread === true,
-        forkThread: args.forkThread === true,
-        autonomy,
-      });
+      const approval = maybeApproval("codex-visible", "Codex execution requires local approval.", { tool: "start_codex_task", ...args, workspacePath, autonomy, executionMode });
       if (approval) return approval;
-      let response: unknown;
-      try {
-        response = args.codexThreadId && args.forkThread
-          ? await forkCodexAppThreadWs({ threadId: args.codexThreadId, workspacePath, instruction: prompt, config: appServerConfig })
-          : args.codexThreadId && args.continueExistingThread
-            ? await resumeCodexAppThreadWs({ threadId: args.codexThreadId, workspacePath, prompt, config: appServerConfig })
-            : await startCodexAppThreadWs({ workspacePath, prompt, config: appServerConfig });
-      } catch (error) {
-        const partialThreadId = partialThreadIdFromError(error);
-        if (partialThreadId) {
-          runStore.createRun({
-            workspacePath,
-            status: "failed",
-            autonomy,
-            prompt,
-            command: "codex-app-thread",
-            metadata: {
-              executionMode,
-              previousCodexThreadId: args.codexThreadId,
-              forkThread: args.forkThread === true,
-              continueExistingThread: args.continueExistingThread === true,
-              ...partialAppThreadMetadata(error),
-            },
-          });
-        }
-        throw error;
-      }
-      const normalized = normalizeAppThreadResponse(response);
-      const threadId = normalized.threadId ?? args.codexThreadId;
-      const run = runStore.createRun({
-        workspacePath,
-        status: appThreadRunStatus(normalized.status),
-        autonomy,
-        prompt,
-        command: "codex-app-thread",
-        metadata: {
-          executionMode,
-          codexThreadId: threadId,
-          appServerResponse: response,
-          appServerEvents: normalized.events,
-          appServerSummary: normalized.summary,
-          previousCodexThreadId: args.codexThreadId,
-          forkThread: args.forkThread === true,
-          continueExistingThread: args.continueExistingThread === true,
-        },
-      });
-      return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: threadId, sourceThreadId: args.forkThread ? args.codexThreadId : undefined }), executionMode, appServer: detection };
+      return managedRunOutput(await coordinator.start({ workspacePath, prompt, autonomy, threadId: args.codexThreadId, fork: args.forkThread, projectId: runStore.getProjectByPath(workspacePath)?.id }));
     }
 
     if (executionMode === "codex-app-visible") {
@@ -996,12 +782,13 @@ Register a project once with \`register_project\`. Continue work by project id, 
         workspacePath,
         userGoal: args.userGoal,
         autonomy,
+        promptHash: createHash("sha256").update(prompt).digest("hex"),
       });
       if (approval) return approval;
       const run = await startCodexAppVisibleTask({ workspacePath, prompt, autonomy, config, runStore, openApp: true, copyClipboard: true });
       return {
         runId: run.id,
-        status: "app_visible_ready",
+        status: run.status,
         executionMode,
         workspacePath,
         promptPath: run.metadata?.promptPath,
@@ -1016,7 +803,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
         requiresManualPaste: true,
         requiresVisibleSupervision: true,
         doNotFallbackToDirectWrite: true,
-        message: "Codex Desktop opened; prompt copied and verified; paste/send the clipboard prompt in the GUI. If the app shows AGENTS.md, ignore it and paste the clipboard contents, or open VIBE_CODEX_PROMPT.md / the returned promptPath. No codex exec, Ghostty, shell script, GUI typing, AppleScript, or accessibility automation was used.",
+        message: "Manual-paste delivery only. Check appOpened and clipboardVerified before pasting. Vibe Codex does not observe Desktop execution or completion.",
       };
     }
 
@@ -1028,6 +815,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
         workspacePath,
         userGoal: args.userGoal,
         autonomy,
+        promptHash: createHash("sha256").update(prompt).digest("hex"),
       });
       if (approval) return approval;
       const run = await startAppSupervisedCodexTask({ workspacePath, prompt, autonomy, config, runStore, openApp: true, copyClipboard: true });
@@ -1059,20 +847,7 @@ Register a project once with \`register_project\`. Continue work by project id, 
       allowHiddenCodex: args.allowHiddenCodex === true,
       skipGitRepoCheckAllowed: args.skipGitRepoCheckAllowed === true,
     };
-    let hiddenApprovedByOneTimeApproval = false;
-    if (!args.allowHiddenCodex) {
-      if (approvalStore.consumeApproved("codex-hidden", hiddenApprovalSummary)) {
-        hiddenApprovedByOneTimeApproval = true;
-      } else {
-      const approval = approvalRequired(approvalStore.create({
-        reason: "Hidden Codex execution requires explicit allowHiddenCodex=true or one-time local approval.",
-        actionRisk: "codex-hidden",
-        actionSummary: hiddenApprovalSummary,
-      }));
-      return { ...approval, doNotFallbackToDirectWrite: true };
-      }
-    }
-    const approval = hiddenApprovedByOneTimeApproval ? null : maybeApproval("codex-hidden", "Hidden Codex execution requires local approval.", hiddenApprovalSummary);
+    const approval = exactApproval("codex-hidden", "Hidden execution requires one-use local owner consent.", { ...hiddenApprovalSummary, promptHash: createHash("sha256").update(prompt).digest("hex") });
     if (approval) return { ...approval, doNotFallbackToDirectWrite: true };
     if (!(await checkCodexAvailable(config))) throw new VibeError("CODEX_NOT_AVAILABLE", "Codex CLI is not available.", { codexBin: config.codexBin });
     if (args.openApp) await openCodexApp(workspacePath, config);
@@ -1096,7 +871,12 @@ Register a project once with \`register_project\`. Continue work by project id, 
   server.registerTool("collect_visible_run_result", {
     description: "Collect prompt/log/git status/git diff for a visible or interactive Vibe Codex run.",
     inputSchema: z.object({ runId: z.string(), maxBytes: z.number().int().positive().max(1_000_000).optional() }),
-  }, async (args) => safeTool(async () => collectVisibleRunResult({ runId: args.runId, config, runStore, maxBytes: args.maxBytes })));
+  }, async (args) => safeTool(async () => {
+    const run = runStore.getRun(args.runId);
+    if (!run) throw new VibeError("CONFIG_ERROR", "Run not found.", { runId: args.runId });
+    await grantedRecordPath(run.workspacePath);
+    return collectVisibleRunResult({ runId: args.runId, config, runStore, maxBytes: args.maxBytes });
+  }));
 
   server.registerTool("detect_codex_app_server", {
     description: "Detect whether a local Codex app-server is reachable through Vibe Codex manager. Does not start it.",
@@ -1111,12 +891,12 @@ Register a project once with \`register_project\`. Continue work by project id, 
   server.registerTool("stop_codex_app_server", {
     description: "Stop the Codex app-server process started by Vibe Codex. Does not stop externally managed servers.",
     inputSchema: z.object({}).optional(),
-  }, async () => safeTool(async () => stopManagedCodexAppServer(config)));
+  }, async () => safeTool(async () => ({ ownerActionRequired: true, nextStep: "Stop active tasks from the local control page. Server shutdown is a local operator action." })));
 
   server.registerTool("restart_codex_app_server", {
     description: "Restart the Vibe Codex-managed local Codex app-server.",
     inputSchema: z.object({}).optional(),
-  }, async () => safeTool(async () => restartManagedCodexAppServer(config)));
+  }, async () => safeTool(async () => ({ ownerActionRequired: true, nextStep: "Restart the relay locally after stopping active tasks." })));
 
   server.registerTool("get_codex_app_server_status", {
     description: "Get current Vibe Codex app-server manager status including URL, transport, PID, and last error.",
@@ -1124,11 +904,13 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async () => safeTool(async () => detectManagedCodexAppServer(config)));
 
   server.registerTool("list_codex_threads", {
-    description: "List local Codex app-server chats/threads. Use this to find an existing Codex chat by name, preview, or thread id before sending a plain follow-up with continue_codex_app_thread.",
+    description: "List remembered Codex app-server threads belonging to currently granted local projects. Use a known thread id before sending a plain follow-up with continue_codex_app_thread. This does not enumerate unrelated local chats.",
     inputSchema: z.object({}).optional(),
   }, async () => safeTool(async () => {
-    const status = await ensureCodexAppServer(config);
-    return listCodexThreadsWs({ config: configWithManagedAppServerUrl(config, status) });
+    const threads = (await accessibleRuns()).filter((run) => typeof run.metadata?.codexThreadId === "string");
+    const seen = new Set<string>();
+    return { threads: threads.filter((run) => { const id = String(run.metadata!.codexThreadId); if (seen.has(id)) return false; seen.add(id); return true; }).map((run) => ({ id: run.metadata!.codexThreadId, cwd: run.workspacePath, preview: run.summary ?? run.prompt.slice(0,160), status: run.status })) };
+
   }));
 
   server.registerTool("start_codex_app_thread", {
@@ -1137,30 +919,12 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot start Codex app threads.", { autonomy });
-    const workspacePath = await assertSafeWorkspacePath(args.workspacePath, config);
-    await assertGitWorkspace(workspacePath);
+    const workspacePath = await grantedWorkspace(args.workspacePath);
+    const approval = maybeApproval("codex-visible", "Codex execution requires local approval.", { tool: "start_codex_app_thread", ...args, workspacePath, autonomy });
+    if (approval) return approval;
     const prompt = compileCodexPrompt({ workspacePath, userGoal: args.userGoal, autonomy });
-    const status = await ensureCodexAppServer(config);
-    let response: unknown;
-    try {
-      response = await startCodexAppThreadWs({ workspacePath, prompt, config: configWithManagedAppServerUrl(config, status) });
-    } catch (error) {
-      const partialThreadId = partialThreadIdFromError(error);
-      if (partialThreadId) {
-        runStore.createRun({
-          workspacePath,
-          status: "failed",
-          autonomy,
-          prompt,
-          command: "codex-app-thread",
-          metadata: { executionMode: "codex-app-thread", ...partialAppThreadMetadata(error) },
-        });
-      }
-      throw error;
-    }
-    const normalized = normalizeAppThreadResponse(response);
-    const run = runStore.createRun({ workspacePath, status: appThreadRunStatus(normalized.status), autonomy, prompt, command: "codex-app-thread", metadata: { executionMode: "codex-app-thread", codexThreadId: normalized.threadId, appServerResponse: response, appServerEvents: normalized.events, appServerSummary: normalized.summary } });
-    return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: normalized.threadId }), appServer: status };
+    const run = await coordinator.start({ workspacePath, prompt, autonomy, projectId: runStore.getProjectByPath(workspacePath)?.id });
+    return managedRunOutput(run);
   }));
 
   server.registerTool("resume_codex_app_thread", {
@@ -1168,48 +932,24 @@ Register a project once with \`register_project\`. Continue work by project id, 
     inputSchema: z.object({ threadId: z.string(), workspacePath: z.string(), prompt: z.string().describe("Optional raw text to submit to the existing Codex thread.").optional(), autonomy: Autonomy.optional() }),
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
-    if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot resume Codex app threads.", { autonomy });
-    const workspacePath = await assertSafeWorkspacePath(args.workspacePath, config);
-    await assertGitWorkspace(workspacePath);
-    const status = await ensureCodexAppServer(config);
-    const response = await resumeCodexAppThreadWs({ threadId: args.threadId, workspacePath, prompt: args.prompt, config: configWithManagedAppServerUrl(config, status) });
-    const normalized = normalizeAppThreadResponse(response);
-    const threadId = normalized.threadId ?? args.threadId;
-    const run = runStore.createRun({
-      workspacePath,
-      status: appThreadRunStatus(normalized.status),
-      autonomy,
-      prompt: args.prompt ?? `Resume Codex app thread ${args.threadId}.`,
-      command: "codex-app-thread resume",
-      metadata: { executionMode: "codex-app-thread", codexThreadId: threadId, appServerResponse: response, appServerEvents: normalized.events, appServerSummary: normalized.summary, operation: "resume" },
-    });
-    return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: threadId }), appServer: status };
+    const workspacePath = await grantedWorkspace(args.workspacePath);
+    if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot resume tasks.", { autonomy });
+    if (!args.prompt) return { threadId: args.threadId, status: "not_started", nextStep: "Provide a prompt to resume, or use get_codex_app_thread_status." };
+    const approval = maybeApproval("codex-visible", "Codex execution requires local approval.", { tool: "resume_codex_app_thread", ...args, workspacePath, autonomy });
+    if (approval) return approval;
+    return managedRunOutput(await coordinator.start({ threadId: args.threadId, workspacePath, prompt: args.prompt, autonomy, projectId: runStore.getProjectByPath(workspacePath)?.id }));
   }));
 
   async function runLocalCodexThreadTurn(args: { threadId: string; instruction: string; workspacePath?: string; autonomy?: AutonomyLevel }) {
     const autonomy = args.autonomy ?? "workspace";
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot continue Codex app threads.", { autonomy });
     const priorRun = findRunByCodexThreadId(args.threadId);
-    const workspacePath = args.workspacePath
-      ? await assertSafeWorkspacePath(args.workspacePath, config)
-      : priorRun?.workspacePath;
-    if (!workspacePath) {
-      throw new VibeError("CONFIG_ERROR", "workspacePath is required when no existing Vibe run mapping is known for this Codex thread.", { threadId: args.threadId });
-    }
-    await assertGitWorkspace(workspacePath);
-    const status = await ensureCodexAppServer(config);
-    const response = await continueCodexAppThreadWs({ threadId: args.threadId, instruction: args.instruction, workspacePath, config: configWithManagedAppServerUrl(config, status) });
-    const normalized = normalizeAppThreadResponse(response);
-    const threadId = normalized.threadId ?? args.threadId;
-    const run = runStore.createRun({
-      workspacePath,
-      status: appThreadRunStatus(normalized.status),
-      autonomy,
-      prompt: args.instruction,
-      command: "codex-app-thread continue",
-      metadata: { executionMode: "codex-app-thread", codexThreadId: threadId, previousRunId: priorRun?.id, appServerResponse: response, appServerEvents: normalized.events, appServerSummary: normalized.summary, operation: "continue" },
-    });
-    return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: threadId }), appServer: status };
+    const inputPath = args.workspacePath ?? priorRun?.workspacePath;
+    if (!inputPath) throw new VibeError("CONFIG_ERROR", "Provide a registered workspace for this thread.", { threadId: args.threadId });
+    const workspacePath = await grantedWorkspace(inputPath);
+    const approval = maybeApproval("codex-visible", "Codex thread continuation requires local approval.", { tool: "continue_codex_app_thread", ...args, workspacePath, autonomy });
+    if (approval) return approval;
+    return managedRunOutput(await coordinator.start({ threadId: args.threadId, workspacePath, prompt: args.instruction, autonomy, projectId: runStore.getProjectByPath(workspacePath)?.id, parentRunId: priorRun?.id }));
   }
 
   server.registerTool("continue_codex_app_thread", {
@@ -1255,47 +995,31 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const autonomy = args.autonomy ?? "workspace";
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot fork Codex app threads.", { autonomy });
-    const workspacePath = await assertSafeWorkspacePath(args.workspacePath, config);
-    await assertGitWorkspace(workspacePath);
-    const status = await ensureCodexAppServer(config);
-    const response = await forkCodexAppThreadWs({ threadId: args.threadId, workspacePath, instruction: args.instruction, config: configWithManagedAppServerUrl(config, status) });
-    const normalized = normalizeAppThreadResponse(response);
-    const nextThreadId = normalized.threadId;
-    const run = runStore.createRun({
-      workspacePath,
-      status: appThreadRunStatus(normalized.status),
-      autonomy,
-      prompt: args.instruction ?? `Fork Codex app thread ${args.threadId}.`,
-      command: "codex-app-thread fork",
-      metadata: { executionMode: "codex-app-thread", codexThreadId: nextThreadId, sourceCodexThreadId: args.threadId, appServerResponse: response, appServerEvents: normalized.events, appServerSummary: normalized.summary, operation: "fork" },
-    });
-    return { ...appThreadOutput({ runId: run.id, workspacePath, response, fallbackThreadId: nextThreadId, sourceThreadId: args.threadId }), appServer: status };
+    const workspacePath = await grantedWorkspace(args.workspacePath);
+    if (!args.instruction) throw new VibeError("CONFIG_ERROR", "Provide an instruction for the new forked task.", {});
+    const approval = maybeApproval("codex-visible", "Forked Codex execution requires local approval.", { tool: "fork_codex_app_thread", ...args, workspacePath, autonomy });
+    if (approval) return approval;
+    return managedRunOutput(await coordinator.start({ threadId: args.threadId, fork: true, workspacePath, prompt: args.instruction, autonomy, projectId: runStore.getProjectByPath(workspacePath)?.id, parentRunId: findRunByCodexThreadId(args.threadId)?.id }));
   }));
 
   server.registerTool("get_codex_app_thread_status", {
     description: "Get experimental Codex app-server thread status.",
     inputSchema: z.object({ threadId: z.string() }),
   }, async (args) => safeTool(async () => {
-    const status = await ensureCodexAppServer(config);
-    const response = await getCodexAppThreadStatusWs({ threadId: args.threadId, config: configWithManagedAppServerUrl(config, status) });
-    const normalized = normalizeAppThreadResponse(response);
-    return {
-      threadId: normalized.threadId ?? args.threadId,
-      codexThreadId: normalized.threadId ?? args.threadId,
-      status: normalized.status,
-      summary: normalized.summary,
-      appServerEvents: normalized.events,
-      appServerResponse: response,
-      appServer: status,
-      experimental: true,
-    };
+    const run = findRunByCodexThreadId(args.threadId);
+    if (!run) throw new VibeError("APPROVAL_REQUIRED", "This thread has no granted project mapping. Start a task in a registered project first.", {});
+    await grantedRecordPath(run.workspacePath);
+    if (run.status === "recovery_required" || run.status === "recovering") await coordinator.reconcile(run.id);
+    const updated = runStore.getRun(run.id)!;
+    return { ...managedRunOutput(updated), run: updated };
   }));
 
   server.registerTool("list_recent_runs", {
     description: "List recent Vibe Codex runs with status, workspace, execution mode, and key artifact paths.",
     inputSchema: z.object({ workspacePath: z.string().optional(), limit: z.number().int().min(1).max(50).optional() }).optional(),
   }, async (args) => safeTool(async () => {
-    const runs = runStore.listRuns(args?.workspacePath).slice(0, args?.limit ?? 10);
+    const workspace = args?.workspacePath ? await grantedWorkspace(args.workspacePath) : undefined;
+    const runs = (await accessibleRuns(workspace)).slice(0, args?.limit ?? 10);
     return { runs };
   }));
 
@@ -1307,15 +1031,9 @@ Register a project once with \`register_project\`. Continue work by project id, 
     if (!canRunCodex(autonomy)) throw new VibeError("APPROVAL_REQUIRED", "Manual autonomy cannot continue Codex tasks.", { autonomy });
     const prior = runStore.getRun(args.runId);
     const summary = { tool: "continue_codex_task", runId: args.runId, workspacePath: prior?.workspacePath, autonomy, allowHiddenCodex: args.allowHiddenCodex === true };
-    let hiddenApprovedByOneTimeApproval = false;
-    if (!args.allowHiddenCodex) {
-      if (approvalStore.consumeApproved("codex-hidden", summary)) {
-        hiddenApprovedByOneTimeApproval = true;
-      } else {
-      return { ...approvalRequired(approvalStore.create({ reason: "Hidden Codex continuation requires explicit allowHiddenCodex=true or one-time local approval.", actionRisk: "codex-hidden", actionSummary: summary })), doNotFallbackToDirectWrite: true };
-      }
-    }
-    const approval = hiddenApprovedByOneTimeApproval ? null : maybeApproval("codex-hidden", "Hidden Codex continuation requires local approval.", summary);
+    if (!prior) throw new VibeError("CONFIG_ERROR", "Run not found.", { runId: args.runId });
+    await grantedRecordPath(prior.workspacePath);
+    const approval = exactApproval("codex-hidden", "Hidden continuation requires one-use local owner consent.", { ...summary, instruction: args.instruction });
     if (approval) return { ...approval, doNotFallbackToDirectWrite: true };
     const run = await continueCodexTask({ runId: args.runId, instruction: args.instruction, autonomy, config, runStore });
     const status = await gitStatus(run.workspacePath, config).catch(() => undefined);
@@ -1334,23 +1052,24 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }));
 
   server.registerTool("approve_action", {
-    description: "Approve a pending Vibe Codex local action gate. Approval is one-time and consumed by the next matching tool call.",
+    description: "Explain how to approve an action in the private local workbench. This remote tool cannot grant approval.",
     inputSchema: z.object({ approvalId: z.string() }),
   }, async (args) => safeTool(async () => {
-    const approval = approvalStore.approve(args.approvalId);
-    if (!approval) throw new VibeError("CONFIG_ERROR", "Approval not found.", { approvalId: args.approvalId });
-    return { approval };
+    return { approvalRequired: true, approvalId: args.approvalId, nextStep: "Only the local owner can approve this action. Open the Vibe Codex control page on this Mac." };
   }));
 
   server.registerTool("list_pending_approvals", {
     description: "List pending Vibe Codex local approval gates.",
     inputSchema: z.object({}).optional(),
-  }, async () => safeTool(async () => ({ approvals: approvalStore.list("pending") })));
+  }, async () => safeTool(async () => ({ approvals: await accessibleApprovals() })));
 
   server.registerTool("reject_action", {
     description: "Reject a pending Vibe Codex local action gate.",
     inputSchema: z.object({ approvalId: z.string(), reason: z.string().optional() }),
   }, async (args) => safeTool(async () => {
+    if (!(await accessibleApprovals()).some((approval) => approval.id === args.approvalId)) {
+      throw new VibeError("CONFIG_ERROR", "Pending approval not found for an accessible workspace.", { approvalId: args.approvalId });
+    }
     const approval = approvalStore.reject(args.approvalId, args.reason);
     if (!approval) throw new VibeError("CONFIG_ERROR", "Approval not found.", { approvalId: args.approvalId });
     return { approval };
@@ -1362,19 +1081,20 @@ Register a project once with \`register_project\`. Continue work by project id, 
   }, async (args) => safeTool(async () => {
     const run = runStore.getRun(args.runId);
     if (!run) throw new VibeError("CONFIG_ERROR", "Run not found.", { runId: args.runId });
+    await grantedRecordPath(run.workspacePath);
     return { run };
   }));
 
   server.registerTool("git_status", {
     description: "Get git status for a workspace.",
     inputSchema: z.object({ workspacePath: z.string() }),
-  }, async (args) => safeTool(async () => ({ status: (await gitStatus(args.workspacePath, config)).stdout })));
+  }, async (args) => safeTool(async () => ({ status: (await gitStatus(await grantedWorkspace(args.workspacePath), config)).stdout })));
 
   server.registerTool("git_diff", {
     description: "Get git diff for a workspace.",
     inputSchema: z.object({ workspacePath: z.string(), maxBytes: z.number().int().positive().max(1_000_000).optional() }),
   }, async (args) => safeTool(async () => {
-    const result = await gitDiff(args.workspacePath, config, args.maxBytes ?? 200_000);
+    const result = await gitDiff(await grantedWorkspace(args.workspacePath), config, args.maxBytes ?? 200_000);
     return { diff: result.stdout, truncated: result.stdout.includes("[output truncated]") };
   }));
 }

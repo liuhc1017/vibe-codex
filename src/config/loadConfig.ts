@@ -59,8 +59,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const urlTokenExpiresAt = env.URL_TOKEN_EXPIRES_AT || undefined;
   const enableExperimentalOAuth = bool(env.ENABLE_EXPERIMENTAL_OAUTH, false);
 
-  if (!relayToken && !developmentMode && !disableAuth) {
-    throw new VibeError("CONFIG_ERROR", "RELAY_TOKEN is required unless VIBE_CODEX_DEV=true or NODE_ENV=test.");
+  if (!relayToken && !developmentMode && !disableAuth && !enableExperimentalOAuth && !allowUrlTokenAuth) {
+    throw new VibeError("CONFIG_ERROR", "Configure OAuth, RELAY_TOKEN, or URL-token authentication before starting Vibe Codex.");
   }
   if (disableAuth && !developmentMode) {
     throw new VibeError("CONFIG_ERROR", "DISABLE_AUTH is only allowed when VIBE_CODEX_DEV=true or NODE_ENV=test.");
@@ -84,9 +84,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const defaultParentDir = path.resolve(expandHome(env.DEFAULT_PARENT_DIR ?? allowedRoots[0] ?? process.cwd()));
   const appServerHost = env.CODEX_APP_SERVER_HOST || "127.0.0.1";
 
+  const port = env.PORT?.trim() ? Number(env.PORT) : 8787;
+  const controlPort = env.CONTROL_PORT?.trim() ? Number(env.CONTROL_PORT) : port === 8788 ? 8789 : 8788;
+  if (!Number.isInteger(port) || !Number.isInteger(controlPort) || port < 1 || port > 65535 || controlPort < 1 || controlPort > 65535 || port === controlPort) {
+    throw new VibeError("CONFIG_ERROR", "PORT and CONTROL_PORT must be distinct ports between 1 and 65535.");
+  }
+
   return {
-    port: int(env.PORT, 8787),
-    relayToken: relayToken ?? (developmentMode ? `vibe_dev_${randomBytes(24).toString("hex")}` : undefined),
+    port,
+    controlPort,
+    ownerDataDir: path.resolve(expandHome(env.OWNER_DATA_DIR ?? ".vibe-codex/owner")),
+    relayToken: relayToken || (developmentMode && !enableExperimentalOAuth ? `vibe_dev_${randomBytes(24).toString("hex")}` : undefined),
     allowUrlTokenAuth,
     urlToken,
     urlTokenRequiredPrefix,
@@ -98,6 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     defaultParentDir,
     publicBaseUrl: env.PUBLIC_BASE_URL || undefined,
     codexBin: env.CODEX_BIN || "codex",
+    codexModel: env.CODEX_MODEL?.trim() || undefined,
     terminalApp: env.TERMINAL_APP || "ghostty",
     terminalFallbackApp: env.TERMINAL_FALLBACK_APP || "Terminal",
     preferGhostty: bool(env.PREFER_GHOSTTY, true),

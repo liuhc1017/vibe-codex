@@ -1,484 +1,196 @@
 # Vibe Codex
 
-Tell ChatGPT what to build. Watch Codex do it.
+**ChatGPT for the conversation. Codex for the code. Your Mac for control.**
 
-Vibe Codex is a local MCP server that lets ChatGPT orchestrate Codex CLI inside approved folders on your Mac. The preferred v0.2 supervised path opens normal interactive Codex in Ghostty with the task prompt submitted as the initial prompt argument. Legacy hidden execution is still available through approval-gated `codex exec`, and the Codex desktop app can be opened for visual supervision.
+Vibe Codex is a single-owner local bridge from ChatGPT web to explicitly registered Git projects. Send a task, see progress and permission requests, read the final answer and repository diff, then continue the same Codex conversation. A private local workbench handles setup, project grants, approvals, input, interruption, and recovery.
 
-## Architecture
+The default execution path is a managed **Codex app-server**, not Codex Desktop automation. No manual paste is required. It does not synchronize with or supervise the Desktop window.
 
 ```text
-User talks to ChatGPT
-        |
-        v
-ChatGPT calls Vibe Codex MCP tools
-        |
-        v
-Vibe Codex validates auth, paths, autonomy, and command risk
-        |
-        v
-Allowed workspace + safe commands + Codex CLI
-        |
-        v
-Codex edits/runs/tests in the workspace
-        |
-        v
-Vibe Codex returns run output, git status, diff, and saved state
+ChatGPT → tunnel → local MCP/OAuth bridge (127.0.0.1:8787)
+                         ↓
+                 registered project → Codex turn
+                         ↑
+Local owner → private workbench (127.0.0.1:8788)
 ```
 
-## Security Warning
+## Get started
 
-This project is designed as a local relay, not a public remote shell. Keep it bound to trusted networks, use a strong `RELAY_TOKEN`, and expose it to ChatGPT only through a secure tunnel you control. Dangerous commands are blocked or approval-gated; raw shell and Codex app-server access are not exposed.
-
-## Setup
+Requirements: Node.js 20+, Git, and an installed, authenticated Codex CLI. macOS is the supported background-service/legacy GUI platform.
 
 ```bash
 npm install
 cp .env.example .env
 ```
 
-Edit `.env` before exposing the server:
+Set real folders in `.env` (they must exist):
 
 ```env
 PORT=8787
-RELAY_TOKEN=
-ALLOW_URL_TOKEN_AUTH=false
-URL_TOKEN=
-URL_TOKEN_REQUIRED_PREFIX=vibe_
-URL_TOKEN_MIN_LENGTH=32
-URL_TOKEN_EXPIRES_AT=
+CONTROL_PORT=8788
 ALLOWED_ROOTS=~/Projects,~/codex-work
 DEFAULT_PARENT_DIR=~/codex-work
-CODEX_BIN=codex
-TERMINAL_APP=ghostty
-TERMINAL_FALLBACK_APP=Terminal
-PREFER_GHOSTTY=true
-DEFAULT_VISIBLE_MODE=codex-app-visible
-CODEX_APP_SERVER_MODE=auto
-CODEX_APP_SERVER_URL=
-CODEX_APP_SERVER_PORT=8765
-CODEX_APP_SERVER_HOST=127.0.0.1
-CODEX_APP_SERVER_TRANSPORT=ws
-CODEX_APP_SERVER_AUTOSTART=true
-CODEX_APP_SERVER_LOG_DIR=.vibe-codex/app-server
-DATABASE_PATH=./vibe-codex.sqlite
-DEFAULT_CODEX_APPROVAL=untrusted
-DEFAULT_CODEX_SANDBOX=workspace-write
-ALLOW_NETWORK_COMMANDS=false
-MAX_COMMAND_OUTPUT_BYTES=200000
-COMMAND_TIMEOUT_MS=120000
-CODEX_TIMEOUT_MS=900000
-REQUIRE_APPROVAL_FOR_CODEX_VISIBLE=false
-REQUIRE_APPROVAL_FOR_CODEX_HIDDEN=true
-REQUIRE_APPROVAL_FOR_WRITE_FILE=false
-REQUIRE_APPROVAL_FOR_NORMAL_COMMANDS=false
-ENABLE_EXPERIMENTAL_OAUTH=false
-OAUTH_ISSUER_BASE_URL=
-OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
-OAUTH_AUTH_CODE_TTL_SECONDS=300
-OAUTH_ALLOWED_REDIRECT_HOSTS=chat.openai.com,chatgpt.com
-OAUTH_REQUIRE_LOCAL_APPROVAL=true
+ENABLE_EXPERIMENTAL_OAUTH=true
+PUBLIC_BASE_URL=
 ```
 
-`RELAY_TOKEN` is required unless you explicitly run in development mode. `ALLOWED_ROOTS` defines the only directories Vibe Codex can touch. `DEFAULT_PARENT_DIR` is where new workspaces are created by default. Use your own local paths; `~` is expanded to your home directory.
-
-For ChatGPT Developer Mode testing where the app UI only offers OAuth, No auth, or Mixed auth, Vibe Codex supports a dev-only URL token:
-
-```env
-ALLOW_URL_TOKEN_AUTH=true
-URL_TOKEN=<long-random-token>
-URL_TOKEN_REQUIRED_PREFIX=vibe_
-URL_TOKEN_MIN_LENGTH=32
-```
-
-Generate and print a token with:
+The historical `ENABLE_EXPERIMENTAL_OAUTH` name is retained for compatibility; OAuth is the recommended ChatGPT connection mode. OAuth-only startup does not require `RELAY_TOKEN`. Leave `PUBLIC_BASE_URL` empty until you have chosen your tunnel URL. Local task execution can be tried before connecting ChatGPT.
 
 ```bash
-npm run pair
-```
-
-Generate and write/update `.env` with URL-token auth enabled:
-
-```bash
-npm run pair -- --write-env
-```
-
-You can also generate a token manually:
-
-```bash
-printf "vibe_%s\n" "$(openssl rand -hex 32)"
-```
-
-Use URL-token auth only as a local development workaround, not production auth. Do not share the URL, because the token is part of the URL. If `URL_TOKEN_EXPIRES_AT` is set to an ISO timestamp, token-route auth is rejected after that time. Bearer auth remains available on `/mcp` for curl and local tools.
-
-## Run Locally
-
-```bash
-npm run dev
-```
-
-The MCP endpoint is:
-
-```text
-http://localhost:8787/mcp
-```
-
-Authenticated requests must include:
-
-```text
-Authorization: Bearer <RELAY_TOKEN>
-```
-
-For production-style local runs:
-
-```bash
+codex login status
+npm run doctor
 npm run build
 npm start
 ```
 
-## Start Automatically On macOS
-
-Install LaunchAgents to start Vibe Codex and its ngrok tunnel whenever you log in:
+Startup prints a one-use opening link valid for one minute. To open the workbench again:
 
 ```bash
-npm run launchd:install
+npm run open
+# Print a fresh link without opening a browser:
+npm run open -- --print
 ```
 
-This installs two user LaunchAgents:
+1. Open the workbench and check **Get ready**.
+2. Register an existing Git repository inside an allowed folder. This grants connected MCP clients access to it; allowed roots alone are not a project grant.
+3. Select the project and send a small task locally.
+4. Handle any requests under **Your decisions**.
+5. Read the final answer and choose **Inspect changes**. Continue the project's conversation for a follow-up.
 
-- `com.vibecodex.server`: builds and runs `npm start` in this repository.
-- `com.vibecodex.ngrok`: waits for `127.0.0.1:8787`, then runs ngrok for the `PUBLIC_BASE_URL` host from `.env`.
+`npm run dev` is available for development. Doctor is read-only: it checks configuration, Codex version/login, existing roots and app-server availability. It does not start a task, open a tunnel, or prove a successful model turn. Some setup checks will remain blocked until a public URL is configured.
 
-Check status:
+## Connect ChatGPT
 
-```bash
-npm run launchd:status
-```
+Expose **only the bridge port** through a tunnel you control. Never tunnel `CONTROL_PORT` or the raw Codex app-server port.
 
-Remove the background services:
-
-```bash
-npm run launchd:uninstall
-```
-
-Logs are written under `.vibe-codex/launchd/`.
-
-## ChatGPT Connector
-
-For ChatGPT local connector use, expose the local MCP endpoint with a secure tunnel such as Cloudflare Tunnel or ngrok, then configure the connector URL to the tunneled `/mcp` endpoint. The macOS LaunchAgent setup above can keep your configured ngrok tunnel running in the background.
-
-For ChatGPT Developer Mode testing with URL token auth:
-
-```text
-Authentication: No auth
-MCP URL: https://<ngrok-url>/mcp/<URL_TOKEN>
-```
-
-The query-string form also works when enabled:
-
-```text
-https://<ngrok-url>/mcp?vibe_token=<URL_TOKEN>
-```
-
-Bearer auth on `/mcp` remains supported and is preferred whenever the client can send static headers.
-
-Experimental OAuth is also available, disabled by default:
+After choosing a stable HTTPS tunnel URL, set:
 
 ```env
+PUBLIC_BASE_URL=https://your-tunnel.example
+# Optional if the issuer uses the same URL:
+OAUTH_ISSUER_BASE_URL=https://your-tunnel.example
 ENABLE_EXPERIMENTAL_OAUTH=true
-OAUTH_ISSUER_BASE_URL=https://<ngrok-url>
-OAUTH_REQUIRE_LOCAL_APPROVAL=true
 ```
 
-ChatGPT Developer Mode OAuth settings:
+Restart the relay after configuration changes. In ChatGPT Developer Mode, add an app/connector using:
 
 ```text
 Authentication: OAuth
-MCP URL: https://<ngrok-url>/mcp
+MCP URL: https://your-tunnel.example/mcp
 ```
 
-Vibe Codex exposes OAuth metadata, `/authorize`, `/token`, `/revoke`, and `/register`. The flow is local-owner approval with PKCE S256 and opaque in-memory access tokens. URL-token auth remains the simpler development fallback.
+Start the connection in ChatGPT, then open the private workbench on your Mac. Check the pending client and exact redirect URI and approve only the request you initiated. The public authorization page waits for that local decision; query parameters, public POST requests and remote `approve_action` calls cannot approve access.
 
-OAuth hardening in v0.2:
+ChatGPT account/UI availability and connector requirements can vary. Automated local tests are not evidence that a particular ChatGPT account successfully connected.
 
-- `/authorize` only accepts dynamically registered clients.
-- `/register`, `/authorize`, `/token`, `/revoke`, and MCP initialize are rate-limited in memory.
-- OAuth scopes are limited to `mcp`.
-- Empty provided OAuth `state` values are rejected.
-- Authorization codes are one-time use and are deleted after successful exchange.
-- Access tokens can be revoked at `/revoke`.
+### Other authentication modes
 
-Dynamic client registration remains unauthenticated when experimental OAuth is enabled because ChatGPT OAuth compatibility depends on public client registration. Keep OAuth behind localhost or a tunnel URL you control.
+- **Static bearer:** set a strong `RELAY_TOKEN` and use `/mcp` with `Authorization: Bearer …` in clients that support static headers. This is not the same as ChatGPT's OAuth choice.
+- **Development URL-token fallback:** `npm run pair` prints a fresh token. Enabling `ALLOW_URL_TOKEN_AUTH=true` permits `/mcp/<URL_TOKEN>` with ChatGPT's “No auth” choice. The URL itself is a credential and can leak into history/logs; prefer OAuth. `npm run pair -- --write-env` explicitly changes `.env`.
 
-## Tools
+Never paste credentials into issues, screenshots, or diagnostics.
 
-MCP resources exposed for ChatGPT App context:
+## The everyday workflow
 
-- `vibe://status`: current relay status, auth mode, app-server status, recent projects/runs, approvals, setup hints, and warnings.
-- `vibe://operator-guide`: concise tool-selection and safety guidance.
-- `vibe://feature-matrix`: feature coverage, auth, paste mode, tests, and limits.
-- `vibe://setup`: concise local setup and ChatGPT Developer Mode instructions.
+In ChatGPT, ask:
 
-Primary MCP tools:
+> Use my registered “My app” project. Make the requested change, report verification and the final result, and do not commit or push.
 
-- `relay_health`
-- `connector_setup_status`
-- `get_connector_url`
-- `list_projects`
-- `register_project`
-- `get_project`
-- `resume_project`
-- `set_project_default_thread`
-- `list_project_runs`
-- `list_project_threads`
-- `start_project_task`
-- `continue_project_task`
-- `collect_project_result`
-- `create_workspace`
-- `list_files`
-- `read_file`
-- `write_file`
-- `run_workspace_command`
-- `open_in_codex_app`
-- `start_codex_task`
-- `continue_codex_task`
-- `detect_codex_app_server`
-- `start_codex_app_server`
-- `stop_codex_app_server`
-- `restart_codex_app_server`
-- `get_codex_app_server_status`
-- `list_codex_threads`
-- `start_codex_app_thread`
-- `resume_codex_app_thread`
-- `continue_codex_app_thread`
-- `fork_codex_app_thread`
-- `get_codex_app_thread_status`
-- `get_run`
-- `git_status`
-- `git_diff`
-- `collect_visible_run_result`
-- `list_recent_runs`
-- `approve_action`
-- `reject_action`
-- `list_pending_approvals`
+The core MCP tools are:
 
-Tool-selection rules:
+| Job | Tools |
+| --- | --- |
+| Pick a granted project | `list_projects`, `get_project`, `resume_project` |
+| Start or follow up | `start_project_task`, `continue_project_task` |
+| Read progress/final answer | `get_run`, `collect_project_result`, `list_project_runs` |
+| Inspect changes | `git_status`, `git_diff` |
+| Send exact raw thread text | `send_codex_app_thread_message`, `continue_codex_app_thread` |
+| Diagnose connection | `relay_health`, `connector_setup_status`, `get_codex_app_server_status` |
 
-- Use `start_project_task` / `continue_project_task` for implementation or inspection tasks in registered projects. These tools add a Vibe Codex handoff envelope.
-- Use `send_codex_app_thread_message` / `run_codex_app_thread_turn` for raw/plain messages to existing Codex app threads. These tools do not add the handoff envelope.
-- Use `codex-app-thread` for true no-paste Codex app/thread execution, `ghostty-visible` as the no-paste terminal fallback, and `codex-app-visible` / `app-supervised` only as manual-paste GUI fallbacks.
-- Do not use `write_file` as fallback after Codex failure unless the user explicitly authorizes direct writes.
-- Do not create a new workspace for a registered project task unless the user explicitly asks for new workspace creation.
+Project task tools compile a handoff envelope. Raw-thread aliases send the supplied text without that envelope. Threads must belong to the granted workspace. `list_codex_threads` lists remembered project threads, not every private Desktop conversation.
 
-`connector_setup_status` can also check whether `PUBLIC_BASE_URL` is reachable. When OAuth is enabled it probes `/.well-known/oauth-protected-resource`, which catches common tunnel failures such as an offline ngrok endpoint before ChatGPT tries to connect.
+Tools return a run ID after Codex acknowledges the turn. **`running` is not completion.** Poll the same run/result until `completed`, `failed`, `interrupted`, or a recoverable state. Workspace/thread conflicts block competing turns.
 
-## Registered Projects
+### Decisions and recovery
 
-Vibe Codex keeps a persistent project registry in SQLite so ChatGPT can reuse real workspaces instead of creating a one-off folder for every request.
+- Codex command/file decisions are one-use local replies, not persistent sandbox or network grants.
+- Structured questions are answered in the workbench. Declared secret-input requests are refused; do not enter passwords or tokens into ordinary answers.
+- Relay action approvals expire after ten minutes and bind the exact action. Approve locally, then retry the unchanged tool call. A remote `allowHiddenCodex=true` is not owner consent.
+- **Stop task** requests interruption of the exact turn. An acknowledgment alone does not prove it stopped; status reflects notification/history confirmation. Existing edits are kept.
+- On disconnect or restart, **Check recovery** reads the exact saved thread/turn. Uncertain work is never automatically resubmitted. If history cannot confirm completion, resolve the original Codex turn locally before starting again.
 
-A project record stores:
+Repository changes can include pre-existing work. Git dirtiness never proves completion or exclusive authorship. Safe result collection includes staged, unstaged and bounded untracked text while omitting recognized secrets, unsafe symlinks and internal artifacts.
 
-- `projectId`
-- `name`
-- `workspacePath`
-- optional `repoRemote`
-- `preferredExecutionMode`
-- optional `defaultCodexThreadId`
-- recent Codex thread IDs
-- `createdAt` / `lastUsedAt`
-- optional notes
+## Configuration and background startup
 
-Use `register_project` for an existing repository or workspace. Registration validates that the path is inside `ALLOWED_ROOTS`; it does not create a new workspace. `start_project_task` and `continue_project_task` operate on a registered project and update `lastUsedAt`. `continue_project_task` uses the project's `defaultCodexThreadId` when available, so repeated requests can continue the same Codex app thread without treating each task as a new project.
+See `.env.example` for all settings. Important ones:
 
-`create_workspace` remains available, but Vibe Codex will not create a workspace from `start_project_task` unless a future explicit creation tool path is added. For existing repos, register once, then reuse the project by `projectId`, name, or workspace path.
+- `OWNER_DATA_DIR` (default `.vibe-codex/owner`): private opening key and workbench address. Keep it private and out of Git. Startup creates a mode-0700 directory and mode-0600 key; it refuses insecure existing permissions, malformed keys or symlinks rather than replacing your credentials.
+- `DATABASE_PATH`: persistent projects, runs, approvals, OAuth grants and hashed credentials. Protect database files and backups; task prompts/output may contain sensitive project information.
+- `CODEX_APP_SERVER_MODE=auto`: detect an existing server or start one on loopback when allowed. `manual` uses only `CODEX_APP_SERVER_URL`; `disabled` never starts one.
+- `CODEX_APP_SERVER_ISOLATE_MCP_SERVERS=true`: managed startup disables unrelated Codex MCP servers.
+- `CODEX_MODEL`: optional model override for managed tasks, including continuation and forks. Blank inherits local Codex configuration. Set a model supported by your CLI login if a turn reports that the configured model is unsupported; catalog discovery alone does not prove inference access.
+- Managed turns enforce workspace-write, the project writable root and no network permissions. Permission-expansion requests fail closed.
+- `CODEX_TIMEOUT_MS`: bounded turn supervision followed by interruption/reconciliation, not a fabricated terminal failure.
+- `REQUIRE_APPROVAL_FOR_CODEX_VISIBLE`, `REQUIRE_APPROVAL_FOR_WRITE_FILE`, and `REQUIRE_APPROVAL_FOR_NORMAL_COMMANDS`: optional additional relay gates. Hidden execution and new project grants always require local consent.
 
-## Codex Execution Modes
+On macOS, optionally install login services **after** local setup works:
 
-`start_codex_task` accepts `executionMode`:
-
-- `codex-app-visible` is the GUI-first manual fallback when `DEFAULT_VISIBLE_MODE=codex-app-visible`. It opens Codex Desktop with `codex app <workspace>`, writes `.vibe-codex/runs/<runId>/prompt.md` plus `metadata.json`, writes a visible root handoff file at `VIBE_CODEX_PROMPT.md`, copies and verifies the prompt on the clipboard, and returns `app_visible_ready` with `promptSubmittedAutomatically:false` and `requiresManualPaste:true`. Paste/send the clipboard prompt in the GUI manually. If Codex Desktop shows `AGENTS.md`, ignore that display and paste the clipboard contents, or open `VIBE_CODEX_PROMPT.md` / the returned `promptPath`. No `codex exec`, Ghostty, shell script, GUI typing, AppleScript, or accessibility automation is used.
-- `ghostty-visible` is the stable no-paste terminal fallback. It writes `.vibe-codex/runs/<runId>/prompt.md` and metadata, then opens normal interactive `codex` in Ghostty with the full prompt passed as one argv argument. It returns `promptSubmittedAutomatically:true`, `launchedCodexDirectly:true`, `usesCodexExec:false`, `usesShellScript:false`, and `requiresManualPaste:false`. No `run-codex.sh`, `codex.log`, hidden exec, shell pipe, GUI typing, or `codex exec` is used in this mode.
-- `terminal-visible` is the legacy supervised script mode. It writes `run-codex.sh` and `codex.log`, then opens macOS Terminal directly.
-- `app-supervised` is a compatibility alias for the older Codex Desktop prompt handoff behavior.
-- `codex-app-thread` is experimental no-paste app/thread execution. In `CODEX_APP_SERVER_MODE=auto`, Vibe Codex first detects a healthy configured or local server and then starts one with `codex app-server --listen ws://127.0.0.1:<port>` when `CODEX_APP_SERVER_AUTOSTART=true`. It connects over WebSocket JSON-RPC and uses app-server methods including `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/read`, and `turn/start`. Tool results normalize `runId`, `threadId`, `codexThreadId`, `status`, `workspacePath`, and app-server events while preserving the raw app-server response. Successful app-thread results include `promptSubmittedAutomatically:true` and `requiresManualPaste:false`. If unavailable, tools return a clear error recommending `ghostty-visible`.
-- `exec-hidden` runs `codex exec` synchronously and returns captured stdout/stderr. It is not the default and requires `allowHiddenCodex: true` or a one-time approval.
-
-Project tools use the project `preferredExecutionMode` unless the tool call overrides it:
-
-- `codex-app-thread` is the no-paste Codex Desktop path. It uses the MCP-managed app-server when available and sends prompts through app-server thread APIs. It can start, resume, continue, or fork threads and stores the returned Codex thread ID on the project when requested.
-- `codex-app-visible` opens Codex Desktop and writes/copies a handoff prompt. This is a manual GUI fallback; the user still sends the prompt in the app.
-- `ghostty-visible` opens normal interactive Codex in Ghostty and submits the initial prompt automatically. This is the stable visible fallback when app-server is unavailable.
-
-In `ghostty-visible`, Vibe Codex launches normal interactive Codex and submits the prompt as Codex's initial prompt argument. The terminal remains yours: watch Codex messages, continue chatting normally, approve or reject Codex prompts, and press Ctrl+C whenever you want to interrupt.
-
-When Ghostty supports direct command launch, Vibe Codex runs `codex "<prompt>"` in the workspace through argv passed to Ghostty. If that launch style is unavailable, it opens Ghostty in the workspace and returns a clear message rather than trying shell interpolation. If Ghostty itself is unavailable, Vibe Codex falls back to macOS Terminal only for a safe workspace-open fallback.
-
-In legacy `terminal-visible`, the generated script prints the exact prompt, run ID, workspace, prompt path, log path, execution mode, terminal app, and redacted Codex command before Codex starts. The script waits at `Press Enter to start Codex, or Ctrl+C to cancel.` Ctrl+C cancels before start or interrupts Codex after start; output is written live to `codex.log`.
-
-Legacy visible scripts write `**VIBE_CODEX_RUN_STARTED**`, `__VIBE_CODEX_RUN_EXIT_CODE=<code>`, and `**VIBE_CODEX_RUN_FINISHED**` markers. `collect_visible_run_result` treats finished exit code `0` as `completed_visible` even if the log contains non-fatal warning text. For `codex-app-visible` and interactive `ghostty-visible`, collection does not expect a log; it compares current `git status --short` against the run baseline and reports `completed_visible` when changed files appeared, `unknown_app_visible` for app GUI runs with no changes yet, or `unknown_interactive` for Ghostty runs with no changes yet. Results include `changedFilesSinceRun`, `newChangedFilesSinceRun`, `gitStatus`, `gitDiff`, artifact paths, execution mode, terminal app when relevant, and `doNotFallbackToDirectWrite: true`.
-
-Ghostty configuration:
-
-```env
-TERMINAL_APP=ghostty
-TERMINAL_FALLBACK_APP=Terminal
-PREFER_GHOSTTY=true
-DEFAULT_VISIBLE_MODE=codex-app-visible
+```bash
+npm run launchd:install
+npm run launchd:status
+npm run launchd:uninstall
 ```
 
-App-server configuration:
+Install/uninstall changes installed user LaunchAgents. Service scripts derive their repository and runtime paths, honor configured ports and use `/health` readiness. The tunnel service requires ngrok and a configured `PUBLIC_BASE_URL`. Logs live under `.vibe-codex/launchd/`. Binary overrides include `NODE_BIN`, `NPM_BIN`, `NGROK_BIN`, and `VIBE_CODEX_REPO_DIR`.
 
-```env
-CODEX_APP_SERVER_MODE=auto
-CODEX_APP_SERVER_URL=
-CODEX_APP_SERVER_PORT=8765
-CODEX_APP_SERVER_HOST=127.0.0.1
-CODEX_APP_SERVER_TRANSPORT=ws
-CODEX_APP_SERVER_AUTOSTART=true
-CODEX_APP_SERVER_LOG_DIR=.vibe-codex/app-server
-CODEX_APP_SERVER_ISOLATE_MCP_SERVERS=true
-```
+## Trust and limitations
 
-Modes:
+This is not a public remote shell or a multi-user service. A connected client can operate all locally registered projects under the configured policy. OAuth grants are single-owner bridge access, not per-project/user isolation.
 
-- `disabled`: never use app-server.
-- `manual`: only use `CODEX_APP_SERVER_URL`.
-- `auto`: detect `CODEX_APP_SERVER_URL`, then detect `ws://127.0.0.1:<port>`, then start a local app-server when autostart is enabled.
+Owner routes are on a separate loopback listener with one-use bootstrap tickets, HttpOnly/SameSite sessions, Host/Origin validation and CSRF checks. Loopback addresses and OAuth credentials are **not** owner authorization. Owner sessions do not survive process restart; open a fresh link. Local processes running as your OS user can read your files and are outside this boundary.
 
-Lifecycle tools:
+Command tools execute narrowly validated argv, not shell strings. Build/test scripts still execute trusted repository code; validation does not make a hostile project safe. Codex has its own sandbox/approval boundary, not the command tool's allowlist. Only register repositories and approve actions you trust.
 
-- `detect_codex_app_server`: probe without starting.
-- `start_codex_app_server`: start or connect to a local app-server.
-- `stop_codex_app_server`: stop only a Vibe Codex-managed process.
-- `restart_codex_app_server`: restart the managed process.
-- `get_codex_app_server_status`: report availability, URL, transport, PID, log dir, and last error.
+Legacy modes are explicit fallbacks via `start_codex_task`:
 
-Vibe Codex does not GUI-automate Codex Desktop. App-thread tools only call local app-server APIs, bind startup to `127.0.0.1` by default, and the relay never exposes raw app-server access externally. If the user asks for no-paste Codex app execution, use `codex-app-thread`; if unavailable, call `start_codex_app_server`; if startup still fails, recommend `codex-app-visible` or `ghostty-visible`.
+- `codex-app-visible` / `app-supervised`: open/copy a Desktop handoff; manual paste, execution/completion not observed.
+- `ghostty-visible`: direct argv launch when supported; otherwise a workspace-opening fallback may require manual input. Completion is not inferred from Git changes.
+- `terminal-visible`: legacy visible script with log/exit markers.
+- `exec-hidden`: synchronous `codex exec`, always one-use owner consent.
 
-By default, Vibe Codex starts managed app-server with `-c 'mcp_servers={}'`. This isolates the no-paste app-thread bridge from unrelated Codex Desktop MCP/plugin auth failures while preserving the app-thread API needed for local Codex turns.
-
-The project handoff prompt also tells Codex to keep searches scoped to the workspace root: use `rg --files` or `find .`, not `find ..`, unless the user explicitly asks to inspect parent directories.
-
-## Approval Gates
-
-Approval env vars:
-
-```env
-REQUIRE_APPROVAL_FOR_CODEX_VISIBLE=false
-REQUIRE_APPROVAL_FOR_CODEX_HIDDEN=true
-REQUIRE_APPROVAL_FOR_WRITE_FILE=false
-REQUIRE_APPROVAL_FOR_NORMAL_COMMANDS=false
-```
-
-When an action needs approval, the tool returns:
-
-```json
-{
-  "approvalRequired": true,
-  "approvalId": "...",
-  "reason": "...",
-  "actionSummary": {}
-}
-```
-
-Call `approve_action` with that `approvalId`, then retry the original tool call. Approval is one-time and consumed by the next matching action. `reject_action` records a rejection.
-
-Direct `write_file` is flagged as `directWrite`. ChatGPT should not use direct file writes as fallback after a failed Codex task unless the user explicitly authorizes fallback.
-
-`run_workspace_command` uses a strict command allowlist. Inline interpreter execution (`node -e`, `python -c`, `bash -c`), shell substitutions, pipes into interpreters, `sudo`, secret reads, and reverse-shell style commands are blocked. Unknown commands are treated as dangerous and are not executed.
-
-## Example Workflow
-
-```text
-User asks ChatGPT:
-"Create a new repo for my Chrome extension anti-doomscrolling prototype. Open it in Codex and ask Codex to build the MVP."
-
-ChatGPT calls:
-1. create_workspace
-2. open_in_codex_app
-3. start_codex_task
-4. collect_visible_run_result
-5. git_status
-6. git_diff
-7. continue_codex_task if needed
-```
-
-Existing project workflow:
-
-```text
-User asks ChatGPT:
-"Use the Vibe Codex project and continue the last Codex thread."
-
-ChatGPT calls:
-1. list_projects
-2. register_project if the workspace is not registered yet
-3. resume_project
-4. start_project_task or continue_project_task
-5. collect_project_result
-```
-
-Raw existing-thread message workflow:
-
-```text
-User asks ChatGPT:
-"Send 'Hi from ChatGPT Web via Vibe Codex' to the Codex app chat named Implement Vibe Codex v0.1."
-
-ChatGPT calls:
-1. list_codex_threads
-2. send_codex_app_thread_message with the exact plain message
-
-Do not call start_project_task or continue_project_task for this workflow.
-```
-
-## Autonomy Levels
-
-- `manual`: health, listing, safe reads, and prompt compilation only.
-- `workspace`: workspace creation, file writes, git init, safe commands, Codex launch/tasks.
-- `build-test`: `workspace` plus normal build/test/install commands.
-- `full-project`: safe and normal project commands, file writes, and Codex tasks.
-
-Blocked commands never run. Dangerous commands are not executed. Normal commands can be approval-gated with `REQUIRE_APPROVAL_FOR_NORMAL_COMMANDS=true`.
-
-## Known Limitations
-
-- Experimental OAuth tokens/codes are in-memory and reset when the relay restarts.
-- Registered projects are persistent in SQLite, but app-server thread availability depends on the local Codex app/app-server runtime.
-- `codex-app-visible` opens Codex Desktop and copies the prompt, but the user must paste/send it manually; completion is inferred from workspace changes.
-- `ghostty-visible` launches normal interactive Codex in Ghostty with the initial prompt already submitted; completion is inferred from workspace changes.
-- `terminal-visible` uses `codex exec` through the legacy visible script.
-- `codex-app-thread` is experimental and requires a local Codex app-server URL; when unavailable, project tools return a clear fallback recommendation instead of silently switching to manual paste.
-- `continue_project_task` can reuse a saved Codex thread ID with `codex-app-thread`; non-app-thread continuation is still approximated through saved run/workspace context.
-- No live streaming yet.
-- No graphical approval UI yet; approvals are MCP tool calls.
-- Dangerous commands are rejected or approval-required instead of executed.
-- The Codex app is opened for supervision only.
-- Shell command strings are accepted after strict risk classification; stronger parsing is planned.
+There is no automatic Desktop synchronization, background service installation, public deployment, commit or push. Prompt instructions are not a security guarantee. Review changes before committing or sharing them.
 
 ## Verification
 
-Run the full local verification bundle:
-
 ```bash
+npm run build
+npm test
 npm run verify
 ```
 
-This runs `npm run build`, `npm test`, then performs an in-process MCP smoke check for initialize, `tools/list`, the Vibe resources, `relay_health`, app-server status, and project registration reuse.
+`verify` builds, runs the regression suite and performs a temporary local MCP smoke: discovery, explicit fixture project grant, asynchronous final answer, same-thread follow-up, correct lineage and safe results against a fake Codex server. It does not touch your existing projects or test a real model/ChatGPT UI.
 
-With `PUBLIC_BASE_URL` and OAuth enabled, run a tunneled OAuth smoke that mimics ChatGPT's dynamic client registration and MCP session flow:
+To test actual execution using your installed Codex CLI and login:
+
+```bash
+npm run verify:live
+# Optional relay-only model override:
+CODEX_MODEL=your-supported-model npm run verify:live
+```
+
+This consumes model quota. It starts isolated loopback bridge, workbench and app-server listeners, uses a disposable database/repository, and exercises owner project registration, OAuth authorization/refresh, MCP discovery, a real file edit, a same-thread follow-up, collected final answers and owner interruption. It approves only its disposable fixture connection, revokes that grant, shuts down its listeners and removes its temporary files. Existing projects, grants and global Codex configuration are untouched. It does not prove ChatGPT web UI connectivity or public tunnel operation.
+
+If startup reports a `NODE_MODULE_VERSION` mismatch, run `npm rebuild better-sqlite3` with the same Node executable used by the service, then restart. Reinstall the LaunchAgents with that Node on PATH if their runtime differs from the one used to install dependencies.
+
+If recovery reports `paginated_threads is not supported yet`, use a newer installed CLI via `CODEX_BIN`; a desktop-bundled CLI may be newer than the one on PATH. Legacy 0.2 nested turn acknowledgments are recovered only when their saved identities agree. If the exact turn is missing from history, the run stays uncertain and continues to block new tasks in that workspace.
+
+Optional, deliberately public:
 
 ```bash
 npm run verify:public
 ```
 
-This checks OAuth metadata, `/register`, `/authorize`, `/token`, MCP initialize, `tools/list`, Vibe resources, `relay_health`, `connector_setup_status`, app-server status, and registration of the current repository without creating a new workspace. Set `VERIFY_PROJECT_PATH=/path/to/repo` to register a different allowed workspace.
+This sends OAuth/MCP requests through the configured tunnel, waits for your private-workbench connection approval, lists already granted projects, and revokes its smoke grant afterward. It never autoapproves, registers a project or runs Codex. Do not run it unless you intend to contact that endpoint.
 
-## Roadmap
-
-- Codex app-server integration
-- Streamed progress events
-- True Codex thread continuation
-- Approval UI
-- Project dashboard
-- Richer diff summaries
-- Per-project profiles
-- Stronger shell parser
-- Better app connector UI
+Details: [Feature matrix](docs/FEATURE_MATRIX.md), [OAuth security model](docs/OAUTH_PLAN.md).

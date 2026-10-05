@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { AddressInfo } from "node:net";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { describe, expect, it } from "vitest";
 import {
   CodexAppServerWsClient,
@@ -13,7 +13,7 @@ import {
 import { tempConfig } from "./helpers.js";
 
 async function withFakeWsServer(
-  handler: (request: any, send: (response: any) => void) => void,
+  handler: (request: any, send: (response: any) => void, socket: WebSocket) => void,
   fn: (url: string, requests: any[]) => Promise<void>,
 ) {
   const requests: any[] = [];
@@ -23,7 +23,7 @@ async function withFakeWsServer(
     socket.on("message", (data) => {
       const request = JSON.parse(data.toString("utf8"));
       requests.push(request);
-      handler(request, (response) => socket.send(JSON.stringify(response)));
+      handler(request, (response) => socket.send(JSON.stringify(response)), socket);
     });
   });
   await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
@@ -31,6 +31,7 @@ async function withFakeWsServer(
   try {
     await fn(`ws://127.0.0.1:${address.port}`, requests);
   } finally {
+    for (const socket of wsServer.clients) socket.terminate();
     await new Promise<void>((resolve) => wsServer.close(() => httpServer.close(() => resolve())));
   }
 }
@@ -117,13 +118,89 @@ describe("Codex app-server WebSocket client", () => {
         expect(requests.find((request) => request.method === "thread/start").params).toMatchObject({ cwd: ctx.root, runtimeWorkspaceRoots: [ctx.root] });
         expect(requests.find((request) => request.method === "thread/resume").params).toMatchObject({ threadId: "thread-1", persistExtendedHistory: false });
         expect(requests.find((request) => request.method === "thread/fork").params).toMatchObject({ threadId: "thread-1", cwd: ctx.root });
-        expect(requests.find((request) => request.method === "thread/read").params).toMatchObject({ threadId: "thread-2", includeTurns: false });
+        expect(requests.find((request) => request.method === "thread/read").params).toMatchObject({ threadId: "thread-2", includeTurns: true });
         const turnStarts = requests.filter((request) => request.method === "turn/start");
         expect(turnStarts.map((request) => request.params.input[0].text)).toEqual(["start prompt", "continue prompt", "fork prompt"]);
       });
     } finally {
       await ctx.cleanup();
     }
+  });
+
+  it("classifies colliding server request ids before outbound response ids", async () => {
+    const notifications: string[] = [];
+    let serverRequestId: string | number | undefined;
+    await withFakeWsServer((request, send) => {
+      if (request.method === "ping") send({ id: request.id, method: "item/commandExecution/requestApproval", params: { command: "git status" } });
+      if (!request.method && request.result) send({ id: request.id, result: { pong: true } });
+    }, async (url, requests) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 500,
+        onNotification: (method) => notifications.push(method),
+        onServerRequest: async (request) => { serverRequestId = request.id; await client.respond(request.id, { decision: "decline" }); },
+      });
+      expect(await client.request("ping")).toEqual({ pong: true });
+      expect(serverRequestId).toBe(1);
+      expect(requests).toContainEqual({ jsonrpc: "2.0", id: 1, result: { decision: "decline" } });
+      expect(notifications).toEqual([]);
+      client.close();
+    });
+  });
+
+  it("refuses unsupported server requests explicitly and contains failing hooks", async () => {
+    await withFakeWsServer((request, send) => {
+      if (request.method === "ping") send({ id: "privileged", method: "account/chatgptAuthTokens/refresh", params: {} });
+      if (request.id === "privileged" && request.error) send({ id: 1, result: request.error });
+    }, async (url) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 500 });
+      expect(await client.request("ping")).toMatchObject({ code: -32601 });
+      client.close();
+    });
+    await withFakeWsServer((request, send) => {
+      if (request.method === "ping") send({ id: 9, method: "unsupported", params: {} });
+      if (request.id === 9 && request.error) send({ id: 1, result: request.error });
+    }, async (url) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 500, onServerRequest: () => { throw new Error("closed db"); } });
+      expect(await client.request("ping")).toMatchObject({ code: -32603 });
+      client.close();
+    });
+  });
+
+  it("bounds retained events and handles disconnect only once", async () => {
+    let disconnects = 0;
+    await withFakeWsServer((request, send) => {
+      if (request.method !== "ping") return;
+      for (let i = 0; i < 250; i++) send({ method: "progress", params: { i, output: "x".repeat(20_000) } });
+      send({ id: request.id, result: true });
+    }, async (url) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 1000, onDisconnect: () => { disconnects++; } });
+      await client.request("ping");
+      expect(client.recentEvents(1000)).toHaveLength(200);
+      expect(JSON.stringify(client.recentEvents(1000)).length).toBeLessThan(3_500_000);
+      expect(client.recentEvents(0)).toEqual([]);
+      client.close();
+      expect(disconnects).toBe(0); // deliberate close is not connection failure
+    });
+  });
+
+  it("rejects pending RPCs on unexpected disconnect and contains disconnect-hook errors", async () => {
+    let disconnects = 0;
+    await withFakeWsServer((_request, _send, socket) => socket.close(), async (url) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 500, onDisconnect: () => { disconnects++; throw new Error("database closed"); } });
+      await expect(client.request("pending")).rejects.toMatchObject({ code: "CODEX_APP_SERVER_UNAVAILABLE" });
+      expect(disconnects).toBe(1);
+      await expect(client.request("after-disconnect")).rejects.toMatchObject({ code: "CODEX_APP_SERVER_UNAVAILABLE" });
+      client.close();
+      expect(disconnects).toBe(1);
+    });
+  });
+
+  it("shares concurrent connection attempts and rejects calls after close", async () => {
+    await withFakeWsServer((request, send) => { if (request.method) send({ id: request.id, result: request.method }); }, async (url) => {
+      const client = new CodexAppServerWsClient({ url, timeoutMs: 500 });
+      expect(await Promise.all([client.request("first"), client.request("second")])).toEqual(["first", "second"]);
+      client.close();
+      await expect(client.request("third")).rejects.toMatchObject({ code: "CODEX_APP_SERVER_UNAVAILABLE" });
+    });
   });
 
   it("builds turn/start input as one text item", async () => {

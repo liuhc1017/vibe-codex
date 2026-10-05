@@ -4,6 +4,22 @@ import path from "node:path";
 import { loadConfig } from "../src/config/loadConfig.js";
 
 describe("auth config hardening", () => {
+  it("loads a relay-specific model override without changing global Codex settings", () => {
+    expect(loadConfig({ NODE_ENV: "test", CODEX_MODEL: " example-model " }).codexModel).toBe("example-model");
+    expect(loadConfig({ NODE_ENV: "test", CODEX_MODEL: " " }).codexModel).toBeUndefined();
+  });
+  it("supports OAuth-only production without generating a bearer credential", () => {
+    const config = loadConfig({ NODE_ENV: "production", ENABLE_EXPERIMENTAL_OAUTH: "true" });
+    expect(config.relayToken).toBeUndefined();
+    expect(config.disableAuth).toBe(false);
+    expect(config.controlPort).not.toBe(config.port);
+  });
+
+  it("rejects invalid or overlapping private/public ports", () => {
+    for (const ports of [{ PORT: "8788", CONTROL_PORT: "8788" }, { PORT: "0" }, { CONTROL_PORT: "65536" }, { PORT: "8787oops" }, { PORT: "1.5" }, { CONTROL_PORT: "invalid" }]) {
+      expect(() => loadConfig({ NODE_ENV: "test", ...ports })).toThrow(/distinct ports/);
+    }
+  });
   it("rejects short URL tokens when URL token auth is enabled", () => {
     expect(() => loadConfig({
       NODE_ENV: "test",

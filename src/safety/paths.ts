@@ -28,28 +28,35 @@ const sensitiveFilePatterns = [
   /cookies?(\.sqlite|\.db)?$/i,
   /login data$/i,
   /keychain/i,
+  /(^|[/\\])(?:\.ssh|\.codex|\.git)([/\\]|$)/i,
+  /(^|[/\\])(?:auth\.json|credentials(?:\.json)?|\.npmrc|\.netrc)($|[/\\])/i,
 ];
 
-async function realpathIfExists(inputPath: string): Promise<string | null> {
-  try {
-    return await fs.realpath(inputPath);
-  } catch {
-    return null;
-  }
-}
-
 async function resolveExistingAware(inputPath: string): Promise<string> {
-  const resolved = path.resolve(inputPath);
-  const existing = await realpathIfExists(resolved);
-  if (existing) return existing;
-  const parent = path.dirname(resolved);
-  const realParent = await realpathIfExists(parent);
-  return realParent ? path.join(realParent, path.basename(resolved)) : resolved;
+  let ancestor = path.resolve(inputPath);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      return path.join(await fs.realpath(ancestor), ...missing);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A dangling link is not a nonexistent directory we may safely create through.
+      const stat = await fs.lstat(ancestor).catch((lstatError: NodeJS.ErrnoException) => {
+        if (lstatError.code !== "ENOENT") throw lstatError;
+        return undefined;
+      });
+      if (stat?.isSymbolicLink()) throw new VibeError("PATH_OUTSIDE_ALLOWED_ROOTS", "Cannot resolve a dangling symlink safely.", { path: ancestor });
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
 }
 
 function isInside(candidate: string, root: string): boolean {
   const relative = path.relative(root, candidate);
-  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (!!relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 export function isSensitivePath(resolvedPath: string): boolean {
@@ -68,8 +75,9 @@ export async function isPathInsideAllowedRoots(resolvedPath: string, config: Con
 }
 
 export async function resolveInsideAllowedRoots(inputPath: string, config: Config): Promise<string> {
-  const resolved = await resolveExistingAware(inputPath.replace(/^~(?=$|[/\\])/, home));
-  if (isSensitivePath(resolved)) {
+  const expanded = inputPath.replace(/^~(?=$|[/\\])/, home);
+  const resolved = await resolveExistingAware(expanded);
+  if (isSensitivePath(path.resolve(expanded)) || isSensitivePath(resolved)) {
     throw new VibeError("SENSITIVE_PATH_BLOCKED", "Sensitive path access is blocked.", { path: resolved });
   }
   if (!(await isPathInsideAllowedRoots(resolved, config))) {
@@ -95,11 +103,31 @@ export async function assertSafeFilePath(workspacePath: string, relativePath: st
   if (!isInside(target, workspace)) {
     throw new VibeError("PATH_OUTSIDE_ALLOWED_ROOTS", "File path escapes the workspace.", { path: target, workspace });
   }
-  if (isSensitivePath(target)) {
+  if (isSensitivePath(rawTarget) || isSensitivePath(target)) {
     throw new VibeError("SENSITIVE_PATH_BLOCKED", "Sensitive file access is blocked.", { path: target });
   }
   if (!(await isPathInsideAllowedRoots(target, config))) {
     throw new VibeError("PATH_OUTSIDE_ALLOWED_ROOTS", "File path is outside allowed roots.", { path: target });
+  }
+  return target;
+}
+
+/** A lexical path inside the workspace whose existing components contain no symlinks. */
+export async function assertSafeNonSymlinkFilePath(workspacePath: string, relativePath: string, config: Config): Promise<string> {
+  const workspace = await assertSafeWorkspacePath(workspacePath, config);
+  const target = await assertSafeFilePath(workspace, relativePath, config);
+  const rawTarget = path.resolve(workspace, relativePath);
+  if (!isInside(rawTarget, workspace)) throw new VibeError("PATH_OUTSIDE_ALLOWED_ROOTS", "Path escapes the workspace.");
+  let current = workspace;
+  const relative = path.relative(workspace, rawTarget);
+  for (const component of relative ? relative.split(path.sep) : []) {
+    current = path.join(current, component);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) throw new VibeError("PATH_OUTSIDE_ALLOWED_ROOTS", "Symlink operands are not allowed.", { path: current });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      break;
+    }
   }
   return target;
 }

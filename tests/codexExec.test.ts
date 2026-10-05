@@ -106,15 +106,15 @@ describe("Codex exec integration", () => {
       launch: false,
       detectDirectCodexSupport: async () => true,
     });
-    expect(run.status).toBe("interactive_started");
+    expect(run.status).toBe("interactive_ready");
     expect(run.codexCommand).toBe("interactive codex handoff");
     expect(run.metadata?.executionMode).toBe("ghostty-visible");
     expect(run.metadata?.terminalApp).toBe("ghostty");
-    expect(run.metadata?.promptSubmittedAutomatically).toBe(true);
-    expect(run.metadata?.launchedCodexDirectly).toBe(true);
+    expect(run.metadata?.promptSubmittedAutomatically).toBe(false);
+    expect(run.metadata?.launchedCodexDirectly).toBe(false);
     expect(run.metadata?.usesCodexExec).toBe(false);
     expect(run.metadata?.usesShellScript).toBe(false);
-    expect(run.metadata?.requiresManualPaste).toBe(false);
+    expect(run.metadata?.requiresManualPaste).toBe(true);
     expect(run.metadata?.copiedToClipboard).toBe(false);
     expect(run.metadata?.scriptPath).toBeUndefined();
     expect(run.metadata?.logPath).toBeUndefined();
@@ -308,6 +308,39 @@ describe("Codex exec integration", () => {
     expect(collected.changedFilesSinceRun).toEqual(collected.newChangedFilesSinceRun);
   });
 
+  it("keeps ordinary assistant prose unknown and preserves tracked filenames/baselines", async () => {
+    await runProcessArgv({ file: "git", args: ["init"], cwd: workspace });
+    await fs.writeFile(path.join(workspace, " file with spaces.txt"), "before\n");
+    await runProcessArgv({ file: "git", args: ["add", "."], cwd: workspace });
+    await runProcessArgv({ file: "git", args: ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "baseline"], cwd: workspace });
+    await fs.writeFile(path.join(workspace, " file with spaces.txt"), "before run\n");
+    const run = await startTerminalVisibleCodexTask({ workspacePath: workspace, prompt: "prompt", autonomy: "workspace", config: ctx.config, runStore: store, launch: false });
+    await fs.writeFile(run.metadata!.logPath as string, "Summary of changes:\ntokens used\nCodex finished.\nerror: quoted source code\n");
+    await fs.writeFile(path.join(workspace, " file with spaces.txt"), "after run\n");
+    await fs.writeFile(path.join(workspace, "new file.txt"), "new\n");
+    const result = await collectVisibleRunResult({ runId: run.id, config: ctx.config, runStore: store });
+    expect(result.status).toBe("running_visible");
+    expect(result.completionKnown).toBe(false);
+    expect(result.changedFiles).toContain(" file with spaces.txt");
+    expect(result.newChangedFilesSinceRun).not.toContain(" file with spaces.txt");
+    expect(result.newChangedFilesSinceRun).toContain("new file.txt");
+  });
+
+  it("reports manual handoff when direct interactive launch is unsupported", async () => {
+    const run = await startGhosttyInteractiveCodexTask({ workspacePath: workspace, prompt: "prompt", autonomy: "workspace", config: ctx.config, runStore: store, detectDirectCodexSupport: async () => false, opener: async () => ({ exitCode: 0, stdout: "", stderr: "", command: "open terminal only" }) });
+    expect(run.metadata?.launchedCodexDirectly).toBe(false);
+    expect(run.metadata?.promptSubmittedAutomatically).toBe(false);
+    expect(run.metadata?.requiresManualPaste).toBe(true);
+  });
+
+  it("rejects result artifacts symlinked outside the workspace", async () => {
+    const run = await startTerminalVisibleCodexTask({ workspacePath: workspace, prompt: "prompt", autonomy: "workspace", config: ctx.config, runStore: store, launch: false });
+    const target = path.join(ctx.root, "outside.log");
+    await fs.writeFile(target, "SHOULD_NOT_READ");
+    await fs.symlink(target, run.metadata!.logPath as string);
+    await expect(collectVisibleRunResult({ runId: run.id, config: ctx.config, runStore: store })).rejects.toMatchObject({ code: "PATH_OUTSIDE_ALLOWED_ROOTS" });
+  });
+
   it("treats finished visible runs with nonzero exit markers as failed", async () => {
     await runProcessArgv({ file: "git", args: ["init"], cwd: workspace });
     const run = await startTerminalVisibleCodexTask({
@@ -343,7 +376,8 @@ describe("Codex exec integration", () => {
 
     await fs.writeFile(path.join(workspace, "interactive-created.txt"), "created", "utf8");
     collected = await collectVisibleRunResult({ runId: run.id, config: ctx.config, runStore: store });
-    expect(collected.status).toBe("completed_visible");
+    expect(collected.status).toBe("unknown_interactive");
+    expect(collected.completionKnown).toBe(false);
     expect(collected.changedFilesSinceRun).toContain("interactive-created.txt");
   });
 
@@ -371,7 +405,8 @@ describe("Codex exec integration", () => {
 
     await fs.writeFile(path.join(workspace, "gui-created.txt"), "created", "utf8");
     collected = await collectVisibleRunResult({ runId: run.id, config: ctx.config, runStore: store });
-    expect(collected.status).toBe("completed_visible");
+    expect(collected.status).toBe("unknown_app_visible");
+    expect(collected.completionKnown).toBe(false);
     expect(collected.changedFilesSinceRun).toContain("gui-created.txt");
     expect(collected.changedFilesSinceRun).not.toContain("preexisting-untracked.txt");
     expect(collected.changedFilesSinceRun).not.toContain("VIBE_CODEX_PROMPT.md");

@@ -1,6 +1,6 @@
 import { AutonomyLevel } from "../config/types.js";
 
-export type RunStatus = "queued" | "running" | "running_visible" | "app_visible_ready" | "interactive_ready" | "interactive_started" | "unknown_interactive" | "unknown_app_visible" | "completed" | "completed_visible" | "failed" | "failed_visible" | "approval_required";
+export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_input" | "recovering" | "recovery_required" | "interrupted" | "running_visible" | "app_visible_ready" | "interactive_ready" | "interactive_started" | "unknown_interactive" | "unknown_app_visible" | "completed" | "completed_visible" | "failed" | "failed_visible" | "approval_required";
 
 export interface ProjectRecord {
   id: string;

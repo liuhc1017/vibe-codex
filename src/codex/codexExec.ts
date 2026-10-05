@@ -1,13 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { Config, AutonomyLevel } from "../config/types.js";
-import { gitDiff, gitStatus } from "../workspace/git.js";
+import { collectWorkspaceChanges, gitDiff, gitStatus, parseGitShortStatus } from "../workspace/git.js";
 import { RunStore } from "../runs/runStore.js";
 import { RunRecord } from "../runs/types.js";
-import { assertSafeWorkspacePath } from "../safety/paths.js";
-import { runProcessArgv } from "../util/spawn.js";
+import { assertSafeWorkspacePath, assertSafeNonSymlinkFilePath } from "../safety/paths.js";
+import { decodeBoundedUtf8, runProcessArgv } from "../util/spawn.js";
 import { compileCodexPrompt } from "./promptCompiler.js";
 import { logger } from "../util/logger.js";
 import { VibeError } from "../util/errors.js";
@@ -22,6 +22,7 @@ export interface CodexExecCapabilities {
 
 const SANDBOX_VALUES = ["read-only", "workspace-write", "danger-full-access"] as const;
 const APPROVAL_VALUES = ["untrusted", "on-failure", "on-request", "never"] as const;
+const artifactWriteFlag = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0);
 
 function normalizeSandbox(value: string | undefined): string {
   if (value && (SANDBOX_VALUES as readonly string[]).includes(value)) return value;
@@ -116,20 +117,21 @@ function redactedCodexScriptCommand(config: Config, capabilities: CodexExecCapab
   return parts.join(" ");
 }
 
-async function ensureRunDir(workspacePath: string, runId: string) {
-  const runDir = path.join(workspacePath, ".vibe-codex", "runs", runId);
+async function ensureRunDir(workspacePath: string, runId: string, config: Config) {
+  if (!/^[A-Za-z0-9_-]+$/.test(runId)) throw new VibeError("CONFIG_ERROR", "Invalid run artifact ID.");
+  const runDir = await assertSafeNonSymlinkFilePath(workspacePath, path.join(".vibe-codex", "runs", runId), config);
   await fs.mkdir(runDir, { recursive: true });
   return runDir;
 }
 
 async function writePrompt(runDir: string, prompt: string) {
   const promptPath = path.join(runDir, "prompt.md");
-  await fs.writeFile(promptPath, prompt, "utf8");
+  await fs.writeFile(promptPath, prompt, { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 });
   return promptPath;
 }
 
-async function writeRootPromptHandoff(workspacePath: string, runId: string, promptPath: string, prompt: string) {
-  const rootPromptPath = path.join(workspacePath, "VIBE_CODEX_PROMPT.md");
+async function writeRootPromptHandoff(workspacePath: string, runId: string, promptPath: string, prompt: string, config: Config) {
+  const rootPromptPath = await assertSafeNonSymlinkFilePath(workspacePath, "VIBE_CODEX_PROMPT.md", config);
   const relativePromptPath = path.relative(workspacePath, promptPath);
   await fs.writeFile(rootPromptPath, [
     "# Vibe Codex Prompt",
@@ -142,7 +144,7 @@ async function writeRootPromptHandoff(workspacePath: string, runId: string, prom
     "---",
     "",
     prompt,
-  ].join("\n"), "utf8");
+  ].join("\n"), { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 });
   return rootPromptPath;
 }
 
@@ -161,7 +163,7 @@ async function writeBaselineMetadata(args: {
   const baselineStatusPath = path.join(args.runDir, "baseline-status.txt");
   const finalStatusPath = path.join(args.runDir, "final-status.txt");
   const metadataPath = path.join(args.runDir, "metadata.json");
-  await fs.writeFile(baselineStatusPath, args.baselineStatus ?? "", "utf8");
+  await fs.writeFile(baselineStatusPath, args.baselineStatus ?? "", { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 });
   await fs.writeFile(metadataPath, JSON.stringify({
     runId: args.runId,
     workspacePath: args.workspacePath,
@@ -174,7 +176,7 @@ async function writeBaselineMetadata(args: {
     executionMode: args.executionMode,
     terminalApp: args.terminalApp,
     createdAt: new Date().toISOString(),
-  }, null, 2), "utf8");
+  }, null, 2), { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 });
   return { baselineStatusPath, finalStatusPath, metadataPath };
 }
 
@@ -245,7 +247,7 @@ export async function createTerminalVisibleRunArtifacts(args: {
   terminalApp?: string;
   baselineStatus?: string;
 }) {
-  const runDir = await ensureRunDir(args.workspacePath, args.runId);
+  const runDir = await ensureRunDir(args.workspacePath, args.runId, args.config);
   const promptPath = await writePrompt(runDir, args.prompt);
   const logPath = path.join(runDir, "codex.log");
   const scriptPath = path.join(runDir, "run-codex.sh");
@@ -295,7 +297,7 @@ printf '%s\\n' 'Codex finished.'
 printf '%s\\n' 'Press Enter to close.'
 read || true
 `;
-  await fs.writeFile(scriptPath, script, { encoding: "utf8", mode: 0o700 });
+  await fs.writeFile(scriptPath, script, { encoding: "utf8", mode: 0o700, flag: artifactWriteFlag });
   await fs.chmod(scriptPath, 0o700);
   return { runDir, promptPath, logPath, scriptPath, baselineStatusPath, finalStatusPath, metadataPath, script };
 }
@@ -333,7 +335,7 @@ export async function launchInteractiveCodexTerminal(args: {
 }) {
   const supportsDirectCodex = args.detectDirectCodexSupport ?? (() => detectGhosttyDirectCodexSupport(args.preferredApp));
   if (args.launch === false) {
-    return { terminalApp: args.preferredApp, result: undefined, fallbackUsed: false, launchedCodexDirectly: await supportsDirectCodex() };
+    return { terminalApp: args.preferredApp, result: undefined, fallbackUsed: false, launchedCodexDirectly: false };
   }
   const directCodex = await supportsDirectCodex();
   const opener = args.opener ?? ((appName: string, directCodex: boolean, prompt: string) => {
@@ -361,7 +363,7 @@ export async function detectGhosttyDirectCodexSupport(appName: string): Promise<
     path.join(process.env.HOME ?? "", "Applications/ghostty.app/Contents/MacOS/ghostty"),
   ].filter(Boolean);
   const binary = candidates.find((candidate) => existsSync(candidate));
-  if (!binary) return true;
+  if (!binary) return false;
   const [help, config] = await Promise.all([
     runProcessArgv({ file: binary, args: ["--help"], timeoutMs: 10_000, maxOutputBytes: 50_000 }).catch(() => undefined),
     runProcessArgv({ file: binary, args: ["+show-config", "--default"], timeoutMs: 10_000, maxOutputBytes: 80_000 }).catch(() => undefined),
@@ -372,10 +374,10 @@ export async function detectGhosttyDirectCodexSupport(appName: string): Promise<
 }
 
 async function createPromptOnlyRunArtifacts(workspacePath: string, runId: string, prompt: string, executionMode: ExecutionMode, config: Config) {
-  const runDir = await ensureRunDir(workspacePath, runId);
+  const runDir = await ensureRunDir(workspacePath, runId, config);
   const promptPath = await writePrompt(runDir, prompt);
   const rootPromptPath = executionMode === "codex-app-visible"
-    ? await writeRootPromptHandoff(workspacePath, runId, promptPath, prompt)
+    ? await writeRootPromptHandoff(workspacePath, runId, promptPath, prompt, config)
     : undefined;
   const baselineStatus = (await gitStatus(workspacePath, config).catch(() => undefined))?.stdout ?? "";
   const { baselineStatusPath, finalStatusPath, metadataPath } = await writeBaselineMetadata({
@@ -388,30 +390,6 @@ async function createPromptOnlyRunArtifacts(workspacePath: string, runId: string
     executionMode,
   });
   return { runDir, promptPath, rootPromptPath, baselineStatusPath, finalStatusPath, metadataPath };
-}
-
-async function buildUntrackedDiff(workspacePath: string, files: string[], maxBytes: number): Promise<string> {
-  let output = "";
-  for (const file of files) {
-    if (output.length >= maxBytes) break;
-    const fullPath = path.join(workspacePath, file);
-    try {
-      const stat = await fs.stat(fullPath);
-      if (!stat.isFile() || stat.size > maxBytes) continue;
-      const content = await fs.readFile(fullPath, "utf8");
-      output += [
-        `diff --git a/${file} b/${file}`,
-        "new file mode 100644",
-        "--- /dev/null",
-        `+++ b/${file}`,
-        ...content.split("\n").filter((line, index, lines) => line !== "" || index < lines.length - 1).map((line) => `+${line}`),
-        "",
-      ].join("\n");
-    } catch {
-      // Ignore files that disappear between status and collection.
-    }
-  }
-  return output.slice(0, maxBytes);
 }
 
 export async function startTerminalVisibleCodexTask(args: {
@@ -489,7 +467,7 @@ export async function startGhosttyInteractiveCodexTask(args: {
     command: "interactive codex handoff",
     metadata: { executionMode: "ghostty-visible", terminalApp: preferredApp },
   });
-  const runDir = await ensureRunDir(cwd, placeholder.id);
+  const runDir = await ensureRunDir(cwd, placeholder.id, args.config);
   const promptPath = await writePrompt(runDir, args.prompt);
   const { baselineStatusPath, finalStatusPath, metadataPath } = await writeBaselineMetadata({
     runDir,
@@ -526,7 +504,7 @@ export async function startGhosttyInteractiveCodexTask(args: {
       promptSubmittedAutomatically: launch.launchedCodexDirectly,
       usesCodexExec: false,
       usesShellScript: false,
-      requiresManualPaste: false,
+      requiresManualPaste: !launch.launchedCodexDirectly,
       runDir,
       promptPath,
       baselineStatusPath,
@@ -612,22 +590,27 @@ export async function collectVisibleRunResult(args: {
 }) {
   const run = args.runStore.getRun(args.runId);
   if (!run) throw new VibeError("CONFIG_ERROR", "Run not found.", { runId: args.runId });
-  const logPath = typeof run.metadata?.logPath === "string" ? run.metadata.logPath : undefined;
-  const baselineStatusPath = typeof run.metadata?.baselineStatusPath === "string" ? run.metadata.baselineStatusPath : undefined;
-  const finalStatusPath = typeof run.metadata?.finalStatusPath === "string" ? run.metadata.finalStatusPath : undefined;
-  const metadataPath = typeof run.metadata?.metadataPath === "string" ? run.metadata.metadataPath : undefined;
+  const safeArtifact = async (value: unknown) => typeof value === "string"
+    ? assertSafeNonSymlinkFilePath(run.workspacePath, path.relative(run.workspacePath, value), args.config)
+    : undefined;
+  const logPath = await safeArtifact(run.metadata?.logPath);
+  const baselineStatusPath = await safeArtifact(run.metadata?.baselineStatusPath);
+  const finalStatusPath = await safeArtifact(run.metadata?.finalStatusPath);
+  const metadataPath = await safeArtifact(run.metadata?.metadataPath);
   let log = "";
   let truncated = false;
   if (logPath) {
     try {
-      const stat = await fs.stat(logPath);
-      const maxBytes = args.maxBytes ?? args.config.maxCommandOutputBytes;
-      const handle = await fs.open(logPath, "r");
+      const requestedLimit = args.maxBytes ?? args.config.maxCommandOutputBytes;
+      const maxBytes = Number.isFinite(requestedLimit) ? Math.max(0, Math.min(4_000_000, Math.floor(requestedLimit))) : args.config.maxCommandOutputBytes;
+      const handle = await fs.open(logPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try {
+        const stat = await handle.stat();
+        if (!stat.isFile()) throw new Error("Log is not a regular file.");
         const length = Math.min(stat.size, maxBytes);
         const buffer = Buffer.alloc(length);
         await handle.read(buffer, 0, length, Math.max(0, stat.size - length));
-        log = buffer.toString("utf8");
+        log = decodeBoundedUtf8(buffer, maxBytes);
         truncated = stat.size > maxBytes;
       } finally {
         await handle.close();
@@ -636,49 +619,32 @@ export async function collectVisibleRunResult(args: {
       log = "";
     }
   }
-  const status = await gitStatus(run.workspacePath, args.config).catch(() => undefined);
-  const maxDiffBytes = args.maxBytes ?? 80_000;
-  const diff = await gitDiff(run.workspacePath, args.config, maxDiffBytes).catch(() => undefined);
-  const statusText = status?.stdout ?? "";
-  if (finalStatusPath) await fs.writeFile(finalStatusPath, statusText, "utf8").catch(() => undefined);
-  const baselineStatus = baselineStatusPath ? await fs.readFile(baselineStatusPath, "utf8").catch(() => "") : "";
-  const changedFiles = statusText
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.slice(3).trim())
-    .filter((file) => !file.startsWith(".vibe-codex/"));
-  const baselineFiles = new Set(baselineStatus
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.slice(3).trim())
-    .filter((file) => !file.startsWith(".vibe-codex/")));
+  const changes = await collectWorkspaceChanges(run.workspacePath, args.config, args.maxBytes ?? 80_000).catch(() => ({ gitStatus: "", gitDiffSummary: "", changedFiles: [] as string[], omittedFiles: [] as string[], truncated: true }));
+  const statusText = changes.gitStatus;
+  if (finalStatusPath) await fs.writeFile(finalStatusPath, statusText, { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 }).catch(() => undefined);
+  const baselineStatus = baselineStatusPath ? await (async () => {
+    const handle = await fs.open(baselineStatusPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > 2_000_000) return "";
+      const buffer = Buffer.alloc(stat.size);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return decodeBoundedUtf8(buffer.subarray(0, bytesRead));
+    } finally { await handle.close(); }
+  })().catch(() => "") : "";
+  const changedFiles = changes.changedFiles;
+  const baselineFiles = new Set(parseGitShortStatus(baselineStatus).map((entry) => entry.path));
   const newChangedFilesSinceRun = changedFiles.filter((file) => !baselineFiles.has(file));
-  const untrackedNewFiles = statusText
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("?? "))
-    .map((line) => line.slice(3).trim())
-    .filter((file) => newChangedFilesSinceRun.includes(file));
-  const untrackedDiff = await buildUntrackedDiff(run.workspacePath, untrackedNewFiles, maxDiffBytes);
-  const gitDiffSummary = [diff?.stdout ?? "", untrackedDiff].filter(Boolean).join("\n");
+  const gitDiffSummary = changes.gitDiffSummary;
+  truncated ||= changes.truncated;
   const isInteractiveGhostty = run.metadata?.executionMode === "ghostty-visible";
   const isCodexAppVisible = run.metadata?.executionMode === "codex-app-visible" || run.metadata?.executionMode === "app-supervised";
-  const completedMarkers = ["**VIBE_CODEX_RUN_FINISHED**", "__VIBE_CODEX_RUN_FINISHED__", "Summary of changes:", "tokens used", "Codex finished."];
-  const failureMarkers = ["Not inside a trusted directory", "error:", "fatal:"];
-  const exitCodeMatch = log.match(/__VIBE_CODEX_RUN_EXIT_CODE=(-?\d+)/);
+  const exitCodeMatch = log.match(/^__VIBE_CODEX_RUN_EXIT_CODE=(-?\d+)$/m);
   const visibleExitCode = exitCodeMatch ? Number.parseInt(exitCodeMatch[1], 10) : undefined;
-  const finishedMarker = log.includes("**VIBE_CODEX_RUN_FINISHED**") || log.includes("__VIBE_CODEX_RUN_FINISHED__");
-  const completedVisible = isInteractiveGhostty || isCodexAppVisible
-    ? newChangedFilesSinceRun.length > 0
-    : visibleExitCode === undefined
-      ? completedMarkers.some((marker) => log.includes(marker))
-      : finishedMarker && visibleExitCode === 0;
-  const failedVisible = !isInteractiveGhostty && !isCodexAppVisible && !completedVisible && (
-    (finishedMarker && typeof visibleExitCode === "number" && visibleExitCode !== 0)
-    || failureMarkers.some((marker) => log.toLowerCase().includes(marker.toLowerCase()))
-  );
+  const finishedMarker = /^(?:\*\*VIBE_CODEX_RUN_FINISHED\*\*|__VIBE_CODEX_RUN_FINISHED__)$/m.test(log);
+  // Dirtiness, assistant prose and a GUI opener's exit code are not task completion evidence.
+  const completedVisible = !isInteractiveGhostty && !isCodexAppVisible && finishedMarker && visibleExitCode === 0;
+  const failedVisible = !isInteractiveGhostty && !isCodexAppVisible && finishedMarker && visibleExitCode !== undefined && visibleExitCode !== 0;
   const collectedStatus = completedVisible ? "completed_visible" : failedVisible ? "failed_visible" : isInteractiveGhostty ? "unknown_interactive" : isCodexAppVisible ? "unknown_app_visible" : run.status;
   if (collectedStatus !== run.status && (collectedStatus === "completed_visible" || collectedStatus === "failed_visible" || collectedStatus === "unknown_interactive" || collectedStatus === "unknown_app_visible")) {
     args.runStore.updateRun(run.id, { status: collectedStatus });
@@ -697,7 +663,7 @@ export async function collectVisibleRunResult(args: {
       newChangedFilesSinceRun,
       gitDiffSummary,
       collectedAt: new Date().toISOString(),
-    }, null, 2), "utf8").catch(() => undefined);
+    }, null, 2), { encoding: "utf8", flag: artifactWriteFlag, mode: 0o600 }).catch(() => undefined);
   }
   return {
     runId: run.id,
@@ -717,10 +683,12 @@ export async function collectVisibleRunResult(args: {
     gitDiff: gitDiffSummary,
     gitDiffSummary,
     changedFiles,
+    omittedFiles: changes.omittedFiles,
+    completionKnown: completedVisible || failedVisible,
     newChangedFilesSinceRun,
     changedFilesSinceRun: newChangedFilesSinceRun,
     summary: collectedStatus === "completed_visible"
-      ? isInteractiveGhostty ? "Interactive Codex run has workspace changes since the prompt handoff." : isCodexAppVisible ? "Codex Desktop visible run has workspace changes since the prompt handoff." : "Visible Codex run completed."
+      ? "Visible Codex run completed with an explicit process exit marker."
       : collectedStatus === "failed_visible"
         ? "Visible Codex run appears to have failed."
         : isInteractiveGhostty ? "Interactive Codex run has no reliable completion marker yet." : isCodexAppVisible ? "Codex Desktop visible run has no reliable completion marker yet." : "Visible Codex run is still pending or running.",

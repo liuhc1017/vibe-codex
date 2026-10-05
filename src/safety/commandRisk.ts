@@ -3,108 +3,105 @@ export type CommandRisk = "safe" | "normal" | "dangerous" | "blocked";
 export interface CommandRiskResult {
   risk: CommandRisk;
   reason: string;
+  /** Present only for a fully validated, executable command. Never pass command to a shell. */
+  argv?: string[];
+  pathOperands?: string[];
 }
 
-const secretPatterns = [
-  /(^|\s|["'])~\/\.ssh(\/|\s|["']|$)/i,
-  /(^|\s|["'])~\/\.codex(\/|\s|["']|$)/i,
-  /Library\/Keychains/i,
-  /Application Support\/(Google\/Chrome|Firefox|BraveSoftware|Microsoft Edge)/i,
-  /(^|\s)(cat|less|more|head|tail|sed|awk)\s+[^|;&]*(id_rsa|id_ed25519|\.pem|\.key|\.p12|\.env|auth\.json|cookies?)/i,
-  /(security\s+find-(generic|internet)-password)/i,
-];
+/** Deliberately not a shell parser: only words and whole, simply quoted words. */
+export function tokenizeCommand(command: string): string[] {
+  if (/[\n\r\x00-\x1f\x7f;$`|&<>\\(){}*?\[\]~#]/.test(command)) {
+    throw new Error("Shell composition, expansion, substitution and redirection are blocked.");
+  }
+  const words: string[] = [];
+  let offset = 0;
+  while (offset < command.length) {
+    while (command[offset] === " ") offset++;
+    if (offset === command.length) break;
+    const quote = command[offset] === "'" || command[offset] === '"' ? command[offset++] : undefined;
+    const start = offset;
+    if (quote) {
+      while (offset < command.length && command[offset] !== quote) offset++;
+      if (offset === command.length) throw new Error("Unterminated quote.");
+      words.push(command.slice(start, offset++));
+      if (offset < command.length && command[offset] !== " ") throw new Error("Quoted words cannot be concatenated.");
+    } else {
+      while (offset < command.length && command[offset] !== " ") {
+        if (command[offset] === "'" || command[offset] === '"') throw new Error("Quotes must surround a whole word.");
+        offset++;
+      }
+      words.push(command.slice(start, offset));
+    }
+  }
+  if (!words.length || words.some((word) => !word)) throw new Error("Empty command or argument.");
+  return words;
+}
 
-function normalized(command: string): string {
-  return command.trim().replace(/\s+/g, " ");
+const plainPath = (value: string) => !value.startsWith("-") && !value.includes(":") && !value.includes("=");
+
+function flagsAndPaths(words: string[], allowed: (flag: string) => boolean, requireSeparator = false): string[] | undefined {
+  const paths: string[] = [];
+  let separator = false;
+  for (const word of words) {
+    if (word === "--" && !separator) { separator = true; continue; }
+    if (!separator && word.startsWith("-")) {
+      if (!allowed(word)) return undefined;
+    } else {
+      if ((requireSeparator && !separator) || !plainPath(word)) return undefined;
+      paths.push(word);
+    }
+  }
+  return paths;
 }
 
 export function classifyCommand(command: string): CommandRiskResult {
-  const cmd = normalized(command);
-  const lower = cmd.toLowerCase();
-  if (!cmd) return { risk: "blocked", reason: "Empty command." };
-
-  if (/^sudo(\s|$)/i.test(cmd)) return { risk: "blocked", reason: "sudo is never allowed." };
-  if (secretPatterns.some((pattern) => pattern.test(cmd))) {
-    return { risk: "blocked", reason: "Command accesses secrets or sensitive local stores." };
+  let argv: string[];
+  try { argv = tokenizeCommand(command); }
+  catch (error) { return { risk: "blocked", reason: (error as Error).message }; }
+  const [file, subcommand, ...rest] = argv;
+  const blocked = (reason: string): CommandRiskResult => ({ risk: "blocked", reason });
+  const unsupported = (): CommandRiskResult => ({ risk: "dangerous", reason: "Command or flags are outside the executable argv allowlist; this operation will not run." });
+  const valid = (paths: string[] = [], normal = false): CommandRiskResult => ({
+    risk: normal ? "normal" : "safe",
+    reason: normal ? "Executes arbitrary trusted repository build/test code; requires build-test or full-project autonomy." : "Validated read-only argv command.",
+    argv, pathOperands: paths,
+  });
+  if (["sudo", "nc", "ncat", "netcat", "eval", "exec"].includes(file)) return blocked("Privileged, network-shell or interpreter commands are blocked.");
+  if (["sh", "bash", "zsh", "node", "python", "python3", "perl", "ruby"].includes(file) && argv.some((word) => word === "-e" || word === "-c")) return blocked("Inline interpreter execution is blocked.");
+  if (file === "rm" && argv.some((word) => word === "/")) return blocked("Destructive system path access is blocked.");
+  if (file === "pwd" && argv.length === 1) return valid();
+  if (["node", "npm", "python", "python3"].includes(file) && argv.length === 2 && subcommand === "--version") return valid();
+  if (file === "ls") {
+    const paths = flagsAndPaths(argv.slice(1), (flag) => /^-[alhAdF1]+$/.test(flag));
+    return paths ? valid(paths.length ? paths : ["."]) : unsupported();
   }
-  if (/(curl|wget)\b[^|;&]*\|\s*(sh|bash|zsh|python|python3|ruby|perl)\b/i.test(cmd)) {
-    return { risk: "blocked", reason: "Piping network output into an interpreter is blocked." };
+  if (file === "find") {
+    if (argv.length !== 7 || !plainPath(subcommand ?? "") || argv[2] !== "-maxdepth" || !/^(?:[1-9]|[1-9][0-9])$/.test(argv[3]) || argv[4] !== "-type" || argv[5] !== "f" || argv[6] !== "-print") {
+      // The traditional six-word form uses find's implicit -print.
+      if (argv.length !== 6 || !plainPath(subcommand ?? "") || argv[2] !== "-maxdepth" || !/^(?:[1-9]|[1-9][0-9])$/.test(argv[3]) || argv[4] !== "-type" || argv[5] !== "f") return unsupported();
+    }
+    return valid([subcommand]);
   }
-  if (/pbpaste\s*\|\s*(curl|wget)\b/i.test(cmd)) {
-    return { risk: "blocked", reason: "Exfiltrating clipboard contents is blocked." };
+  if (file === "git") {
+    let paths: string[] | undefined;
+    if (subcommand === "status") paths = flagsAndPaths(rest, (flag) => ["--short", "-s", "--porcelain", "--porcelain=v1", "--branch", "-b", "--untracked-files=all", "--untracked-files=normal", "--untracked-files=no"].includes(flag), true);
+    if (subcommand === "diff") paths = flagsAndPaths(rest, (flag) => ["--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--summary", "--check", "--cached", "--staged", "--no-ext-diff", "--no-textconv"].includes(flag) || /^(?:-U|--unified=)(?:[0-9]|[1-9][0-9])$/.test(flag), true);
+    if (subcommand === "log" && rest.includes("--oneline")) paths = flagsAndPaths(rest, (flag) => flag === "--oneline" || /^(?:-n|--max-count=)[1-9][0-9]{0,2}$/.test(flag), true);
+    return paths ? valid(paths) : unsupported();
   }
-  if (/[`]/.test(cmd) || /\$\(/.test(cmd)) {
-    return { risk: "blocked", reason: "Shell command substitution is blocked." };
+  if (file === "npm") {
+    if (subcommand === "test" || (subcommand === "run" && ["build", "lint", "test"].includes(rest[0]))) {
+      const extra = subcommand === "test" ? rest : rest.slice(1);
+      if (!extra.length) return valid([], true);
+      if (extra[0] !== "--") return unsupported();
+      const paths = flagsAndPaths(extra.slice(1), (flag) => ["--run", "--watch=false", "--runInBand", "--coverage", "--no-coverage", "-q", "-v"].includes(flag));
+      return paths ? valid(paths, true) : unsupported();
+    }
   }
-  if (/(^|\s)(eval|exec)(\s|$)/i.test(cmd)) {
-    return { risk: "blocked", reason: "Shell eval/exec is blocked." };
+  if (file === "pytest" || file === "vitest") {
+    const words = file === "vitest" && subcommand === "run" ? rest : argv.slice(1);
+    const paths = flagsAndPaths(words, (flag) => ["-q", "-v", "--verbose", "--run", "--coverage", "--watch=false", "--disable-warnings", "--no-header", "--no-summary"].includes(flag));
+    return paths ? valid(paths, true) : unsupported();
   }
-  if (/^(node|python|python3|perl|ruby|bash|sh|zsh)\s+-(e|c)(\s|$)/i.test(cmd)) {
-    return { risk: "blocked", reason: "Inline interpreter execution is blocked." };
-  }
-  if (/\|\s*(node|python|python3|perl|ruby|bash|sh|zsh)\b/i.test(cmd)) {
-    return { risk: "blocked", reason: "Piping into interpreters is blocked." };
-  }
-  if (/(\bnc\b|\bncat\b|\bnetcat\b|\/dev\/tcp\/|\/dev\/udp\/|bash\s+-i|sh\s+-i|0<&|1>&|2>&)/i.test(cmd)) {
-    return { risk: "blocked", reason: "Network shell or reverse-shell style command is blocked." };
-  }
-  if (/^rm\s+-[^\s]*r[^\s]*f?[^\s]*(\s+|$)(\/|~|\$HOME)(\s|$)/i.test(cmd) || /^rm\s+-[^\s]*f?[^\s]*r[^\s]*(\s+|$)(\/|~|\$HOME)(\s|$)/i.test(cmd)) {
-    return { risk: "blocked", reason: "Destructive remove against system or home path is blocked." };
-  }
-
-  const safePatterns = [
-    /^git status(\s|$)/,
-    /^git diff(\s|$)/,
-    /^git log --oneline(\s|$)/,
-    /^ls(\s|$)/,
-    /^pwd$/,
-    /^find \. -maxdepth [1-9][0-9]* -type f(\s|$)/,
-    /^node --version$/,
-    /^npm --version$/,
-    /^python --version$/,
-    /^python3 --version$/,
-    /^npm test(\s|$)/,
-    /^npm run (build|lint|test)(\s|$)/,
-    /^pytest(\s|$)/,
-    /^vitest(\s|$)/,
-  ];
-  if (safePatterns.some((pattern) => pattern.test(cmd))) {
-    return { risk: "safe", reason: "Command matches the safe allowlist." };
-  }
-
-  if (/^git reset --hard(\s|$)/.test(lower) || /^git clean -[^\s]*(f|d)/.test(lower)) {
-    return { risk: "dangerous", reason: "Destructive git command requires approval." };
-  }
-  if (/^(chmod|chown)\s+-R(\s|$)/i.test(cmd)) {
-    return { risk: "dangerous", reason: "Recursive permission or ownership changes require approval." };
-  }
-  if (/^(curl|wget)(\s|$)/i.test(cmd)) {
-    return { risk: "dangerous", reason: "Network fetch commands require approval in v0.2." };
-  }
-  if (/^brew install(\s|$)/i.test(cmd)) {
-    return { risk: "dangerous", reason: "System package installation requires approval." };
-  }
-  if (/^npm install -g(\s|$)/i.test(cmd)) {
-    return { risk: "dangerous", reason: "Global npm installation requires approval." };
-  }
-  if (/^pip(3)? install(?!\s+-r\s+requirements\.txt)(\s|$)/i.test(cmd)) {
-    return { risk: "dangerous", reason: "Ad hoc pip installation requires approval." };
-  }
-  if (/^rm\s+-[^\s]*r/i.test(cmd)) {
-    return { risk: "dangerous", reason: "Recursive remove requires approval." };
-  }
-
-  const normalPatterns = [
-    /^npm install(\s|$)/,
-    /^npm create vite@latest(\s|$)/,
-    /^npm run dev(\s|$)/,
-    /^python scripts\/validate\.py(\s|$)/,
-    /^python3 scripts\/validate\.py(\s|$)/,
-    /^pip install -r requirements\.txt(\s|$)/,
-  ];
-  if (normalPatterns.some((pattern) => pattern.test(cmd))) {
-    return { risk: "normal", reason: "Command is a normal project setup/build command." };
-  }
-
-  return { risk: "dangerous", reason: "Command is not recognized by the v0.2 allowlist." };
+  return unsupported();
 }

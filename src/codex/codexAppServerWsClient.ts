@@ -21,6 +21,18 @@ export interface CodexThreadTurnResult {
   events: CodexAppServerWsEvent[];
 }
 
+export interface CodexServerRequest {
+  id: string | number;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+export interface CodexAppServerWsHooks {
+  onNotification?: (method: string, params: Record<string, unknown>, event: CodexAppServerWsEvent) => void;
+  onServerRequest?: (request: CodexServerRequest, event: CodexAppServerWsEvent) => void | Promise<void>;
+  onDisconnect?: (error: Error) => void;
+}
+
 type Pending = {
   method: string;
   resolve: (value: unknown) => void;
@@ -38,7 +50,7 @@ function toWsUrl(rawUrl: string): string {
   return parsed.toString();
 }
 
-function extractThreadId(response: unknown): string | undefined {
+export function extractThreadId(response: unknown): string | undefined {
   if (typeof response !== "object" || response === null) return undefined;
   const record = response as Record<string, unknown>;
   if (typeof record.threadId === "string") return record.threadId;
@@ -53,7 +65,7 @@ function extractThreadId(response: unknown): string | undefined {
   return undefined;
 }
 
-function extractTurnId(response: unknown): string | undefined {
+export function extractTurnId(response: unknown): string | undefined {
   if (typeof response !== "object" || response === null) return undefined;
   const record = response as Record<string, unknown>;
   if (typeof record.turnId === "string") return record.turnId;
@@ -84,46 +96,64 @@ function turnStartError(error: unknown, args: { threadId: string; threadResponse
 export class CodexAppServerWsClient {
   private readonly url: string;
   private readonly timeoutMs: number;
+  private readonly hooks: CodexAppServerWsHooks;
   private ws?: WebSocket;
+  private connecting?: Promise<void>;
+  private closed = false;
+  private disconnected = false;
   private nextId = 1;
   private pending = new Map<string | number, Pending>();
+  private readonly serverRequests = new Set<string | number>();
   private readonly events: CodexAppServerWsEvent[] = [];
 
-  constructor(args: { url: string; timeoutMs?: number }) {
+  constructor(args: { url: string; timeoutMs?: number } & CodexAppServerWsHooks) {
     this.url = toWsUrl(args.url);
     this.timeoutMs = args.timeoutMs ?? 30_000;
+    this.hooks = args;
   }
 
   recentEvents(limit = 100): CodexAppServerWsEvent[] {
-    return this.events.slice(-limit);
+    const count = Math.max(0, Math.min(200, Math.floor(limit)));
+    return count ? this.events.slice(-count) : [];
   }
 
   async connect(): Promise<void> {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(this.url);
+    if (this.closed || this.disconnected) throw new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Codex app-server client is closed; create a new connection.", {});
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.connecting) return this.connecting;
+    this.connecting = new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(this.url, { maxPayload: 16 * 1024 * 1024 });
+      this.ws = ws;
+      let opened = false;
       const timer = setTimeout(() => {
-        ws.close();
+        ws.terminate();
         reject(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Timed out connecting to Codex app-server WebSocket.", { url: this.url }));
       }, this.timeoutMs);
       ws.once("open", () => {
         clearTimeout(timer);
-        this.ws = ws;
-        ws.on("message", (data) => this.onMessage(data));
-        ws.on("close", () => this.rejectAll(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Codex app-server WebSocket closed.", { url: this.url })));
-        ws.on("error", (error) => this.rejectAll(error instanceof Error ? error : new Error(String(error))));
+        if (this.closed) { ws.close(); return reject(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Codex app-server client closed while connecting.", {})); }
+        opened = true;
         resolve();
       });
-      ws.once("error", (error) => {
+      ws.on("message", (data) => this.onMessage(data));
+      ws.on("close", () => {
         clearTimeout(timer);
-        reject(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Failed to connect to Codex app-server WebSocket.", { url: this.url, error: error.message }));
+        const error = new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Codex app-server WebSocket closed.", { url: this.url });
+        if (!opened) reject(error);
+        this.handleDisconnect(error);
+      });
+      ws.on("error", (error) => {
+        clearTimeout(timer);
+        if (!opened) reject(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Failed to connect to Codex app-server WebSocket.", { url: this.url, error: error.message }));
+        this.handleDisconnect(error);
       });
     });
+    return this.connecting;
   }
 
   async initialize(): Promise<unknown> {
     const response = await this.request("initialize", {
-      clientInfo: { name: "vibe-codex", version: "0.2.1" },
+      clientInfo: { name: "vibe-codex", version: "0.3.0" },
       capabilities: {
         experimentalApi: true,
         requestAttestation: false,
@@ -168,9 +198,40 @@ export class CodexAppServerWsClient {
     ws.send(JSON.stringify(payload));
   }
 
+  async respond(id: string | number, result: unknown): Promise<void> {
+    return this.sendServerResponse(id, { result });
+  }
+
+  async refuse(id: string | number, message = "This app-server request is not supported by Vibe Codex.", code = -32601): Promise<void> {
+    return this.sendServerResponse(id, { error: { code, message } });
+  }
+
   close(): void {
-    this.ws?.close();
+    if (this.closed) return;
+    this.closed = true;
+    if (this.ws?.readyState === WebSocket.CONNECTING) this.ws.terminate();
+    else this.ws?.close();
+    this.serverRequests.clear();
     this.rejectAll(new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Codex app-server WebSocket client closed.", { url: this.url }));
+  }
+
+  private async sendServerResponse(id: string | number, response: { result: unknown } | { error: JsonRpcErrorObject }): Promise<void> {
+    if (!this.serverRequests.has(id)) throw new VibeError("CODEX_REQUEST_NOT_FOUND", "App-server request is no longer pending.", { id });
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN || this.closed || this.disconnected) throw new VibeError("CODEX_APP_SERVER_UNAVAILABLE", "Cannot reply on a disconnected app-server connection.", {});
+    const payload = JSON.stringify({ jsonrpc: "2.0", id, ...response });
+    this.serverRequests.delete(id);
+    await new Promise<void>((resolve, reject) => ws.send(payload, (error) => error ? reject(error) : resolve()));
+  }
+
+  private remember(message: unknown): CodexAppServerWsEvent {
+    const serialized = JSON.stringify(message);
+    const event = { receivedAt: new Date().toISOString(), message: serialized.length > 16_384
+      ? { truncated: true, preview: serialized.slice(0, 16_384) }
+      : message };
+    this.events.push(event);
+    if (this.events.length > 200) this.events.shift();
+    return event;
   }
 
   private onMessage(data: WebSocket.RawData): void {
@@ -178,14 +239,39 @@ export class CodexAppServerWsClient {
     try {
       message = JSON.parse(data.toString("utf8"));
     } catch {
-      this.events.push({ receivedAt: new Date().toISOString(), message: { invalidJson: data.toString("utf8") } });
+      this.remember({ invalidJson: data.toString("utf8").slice(0, 16_384) });
       return;
     }
-    this.events.push({ receivedAt: new Date().toISOString(), message });
-    if (typeof message !== "object" || message === null) return;
+    const event = this.remember(message);
+    if (typeof message !== "object" || message === null || Array.isArray(message)) return;
     const record = message as Record<string, unknown>;
-    const id = record.id as string | number | undefined;
-    if (id == null || !this.pending.has(id)) return;
+    const id = typeof record.id === "string" || typeof record.id === "number" ? record.id : undefined;
+    // Server requests and outbound responses have independent id spaces. Method
+    // classification MUST happen first, even if the server reuses a pending id.
+    if (typeof record.method === "string") {
+      const params = typeof record.params === "object" && record.params !== null && !Array.isArray(record.params)
+        ? record.params as Record<string, unknown> : {};
+      if (id === undefined) {
+        if (record.method === "serverRequest/resolved" && (typeof params.requestId === "string" || typeof params.requestId === "number")) this.serverRequests.delete(params.requestId);
+        try { this.hooks.onNotification?.(record.method, params, event); } catch { /* consumer must not crash the transport */ }
+        return;
+      }
+      if (this.serverRequests.has(id)) return;
+      this.serverRequests.add(id);
+      if (this.serverRequests.size > 100 || !this.hooks.onServerRequest) {
+        void this.refuse(id).catch(() => undefined);
+        return;
+      }
+      try {
+        Promise.resolve(this.hooks.onServerRequest({ id, method: record.method, params }, event)).catch(() => {
+          if (this.serverRequests.has(id)) void this.refuse(id, "App-server request handler failed safely.", -32603).catch(() => undefined);
+        });
+      } catch {
+        void this.refuse(id, "App-server request handler failed safely.", -32603).catch(() => undefined);
+      }
+      return;
+    }
+    if (id === undefined || !this.pending.has(id) || !("result" in record || "error" in record)) return;
     const pending = this.pending.get(id)!;
     this.pending.delete(id);
     clearTimeout(pending.timer);
@@ -195,10 +281,19 @@ export class CodexAppServerWsClient {
         method: pending.method,
         code: rpcError.code,
         data: rpcError.data,
+        rpcRejected: true,
       }));
       return;
     }
     pending.resolve(record.result);
+  }
+
+  private handleDisconnect(error: Error): void {
+    this.rejectAll(error);
+    this.serverRequests.clear();
+    if (this.closed || this.disconnected) return;
+    this.disconnected = true;
+    try { this.hooks.onDisconnect?.(error); } catch { /* shutdown/closed databases must not escape event callbacks */ }
   }
 
   private rejectAll(error: Error): void {
@@ -223,6 +318,7 @@ export async function withCodexAppServerWsClient<T>(args: { url: string; config:
 
 export function threadStartParams(args: { workspacePath: string; config: Config }) {
   return {
+    ...(args.config.codexModel ? { model: args.config.codexModel } : {}),
     cwd: args.workspacePath,
     runtimeWorkspaceRoots: [args.workspacePath],
     approvalPolicy: args.config.defaultCodexApproval,
@@ -236,6 +332,7 @@ export function threadStartParams(args: { workspacePath: string; config: Config 
 
 export function turnStartParams(args: { threadId: string; workspacePath: string; prompt: string; config: Config }) {
   return {
+    ...(args.config.codexModel ? { model: args.config.codexModel } : {}),
     threadId: args.threadId,
     input: [{ type: "text", text: args.prompt, text_elements: [] }],
     cwd: args.workspacePath,
@@ -275,6 +372,7 @@ export async function resumeCodexAppThreadWs(args: { threadId: string; workspace
     config: args.config,
     fn: async (client) => {
       const threadResponse = await client.request("thread/resume", {
+        ...(args.config.codexModel ? { model: args.config.codexModel } : {}),
         threadId: args.threadId,
         cwd: args.workspacePath,
         runtimeWorkspaceRoots: [args.workspacePath],
@@ -309,6 +407,7 @@ export async function forkCodexAppThreadWs(args: { threadId: string; workspacePa
     config: args.config,
     fn: async (client) => {
       const threadResponse = await client.request("thread/fork", {
+        ...(args.config.codexModel ? { model: args.config.codexModel } : {}),
         threadId: args.threadId,
         cwd: args.workspacePath,
         runtimeWorkspaceRoots: [args.workspacePath],
@@ -346,6 +445,6 @@ export async function getCodexAppThreadStatusWs(args: { threadId: string; config
   return withCodexAppServerWsClient({
     url: args.config.codexAppServerUrl,
     config: args.config,
-    fn: (client) => client.request("thread/read", { threadId: args.threadId, includeTurns: false }),
+    fn: (client) => client.request("thread/read", { threadId: args.threadId, includeTurns: true }),
   });
 }

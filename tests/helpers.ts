@@ -7,6 +7,8 @@ export async function tempConfig(): Promise<{ config: Config; root: string; clea
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vibe-codex-test-"));
   const config: Config = {
     port: 8787,
+    controlPort: 8788,
+    ownerDataDir: path.join(root, ".vibe-codex", "owner"),
     relayToken: "test",
     allowUrlTokenAuth: false,
     urlToken: undefined,
